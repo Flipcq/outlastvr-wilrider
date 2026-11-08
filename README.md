@@ -12,7 +12,7 @@ The launcher was originally created by **StrikeZoneVR**. This fork keeps its ori
 
 ## Installation
 
-1. Download the latest release
+1. Download the [![Latest Release](https://img.shields.io/github/v/release/Flipcq/outlastvr-wilrider?display_name=tag&style=flat-square)](https://github.com/Flipcq/outlastvr-wilrider/releases/latest)
 
 2. Find your Outlast installation folder. In Steam, right-click **Outlast**, select **Manage**, then **Browse local files**.
 
@@ -59,8 +59,8 @@ For more information, visit the [Outlast Head Bob Remover GitHub repository](htt
 
 # Controls
 
+<img width="1920" height="1080" alt="controllers rebuild" src="https://github.com/user-attachments/assets/023dd2f5-aa76-4a23-bede-bc016843e83f" />
 
-## Quest Controllers
 | Left controller                                  | Right controller                                         |
 | ------------------------------------------------ | -------------------------------------------------------- |
 | Stick: Walk                                      | Stick: Turn (smooth or snap)                             |
@@ -119,15 +119,21 @@ Door interactions use the same input as **Button B** (Left Mouse Button in the o
 
 ## Manual Battery Reloading
 
+<img width="3328" height="1872" alt="battery" src="https://github.com/user-attachments/assets/c73a300b-67ad-4c3e-8a13-e305d0a8f12b" />
+
 Physically reload the camcorder by taking a replacement battery from Miles's left hip and bringing it to the camcorder.
 
 The reload uses the game's original battery replacement animation. Both arms and controller grips are temporarily locked during the process to prevent hand tracking from interfering with Miles's animation.
 
 ## Physical Document Interaction
 
+<img width="3328" height="1872" alt="document" src="https://github.com/user-attachments/assets/c0c12113-2ba5-405b-be45-0692242c3629" />
+
 Grab the document folder from Miles's left shoulder and hold it in front of you to access the document menu. The folder must remain in view for a few seconds to trigger the menu.
 
 ## Climbing
+
+<img width="3328" height="1872" alt="climb" src="https://github.com/user-attachments/assets/374efd44-84ca-4be3-84df-c9f8cd24fd7b" />
 
 Climbing has three available modes: **Button Only**, **Hybrid**, and **Physical**.
 
@@ -138,6 +144,46 @@ Climbing has three available modes: **Button Only**, **Hybrid**, and **Physical*
 - **Physical:** Climbing is performed entirely with your hands. Analog-stick climbing is disabled for ladders, so you must physically use your hands to climb them. When jumping toward a higher platform, Miles automatically grabs the ledge with his left hand. Pressing the left controller's grip button releases control back to the player, allowing you to move your hand freely. You can also climb using both hands.
 
 Ledge walking works the same way in all three modes: while hanging from a ledge, the walk stick moves Miles sideways along it using the game's animation, as long as **both** hands are holding the ledge. If one hand is released, the stick does nothing. Releasing the left grip while the right hand is not holding the ledge keeps Miles's left hand attached; he cannot fall from that position.
+
+---
+
+# Improvements & Fixes
+
+## 1. Bug Fixes
+
+- **Shortcut Fixes:** Corrected shortcut assignments.
+
+- **Camcorder Positioning:** Fixed incorrect camcorder positioning and alignment.
+
+- **Door Closing Controls:** Fixed an issue that caused door-closing input to be registered unreliably.
+
+- **Lens Flare Rendering:** Fixed an issue that caused lens flare effects to remain visible through walls.
+
+- **Input Reliability:** Improved the reliability of jump and door interaction inputs to prevent occasional missed button presses. This improvement has not yet been fully tested.
+
+## 2. Gameplay Improvements
+
+- **Door Interaction:** Improved hand positioning and grip on door handles, added angular acceleration to door movement, and made doors easier to open. Door opening and closing sounds were also added.
+
+- **Camcorder Handling:** Introduced a hybrid mode that allows players to hold the camcorder up to their face or lock it in position without physically holding it.
+
+- **Head Bob Removal:** Removed head bobbing using a standalone patcher.
+
+- **Camcorder HUD:** Redesigned the camcorder display to closely match the original game's HUD, with multiple customization options available in the launcher.
+
+- **Battery Reload Animation:** Fixed the initial animation skip when starting a battery reload, ensuring the reload animation plays from the beginning.
+
+## 3. New Features
+
+- **Manual Battery Reloading:** Added physical battery interaction, allowing players to grab a replacement battery from Miles's left hip and bring it to the camcorder to reload.
+
+- **Physical Document Interaction:** Added physical document handling, allowing players to grab the document folder from Miles's left shoulder and open the document menu by looking at it for a few seconds.
+
+- **Head-Relative Menu Positioning:** The menu now dynamically follows the direction the player is looking, keeping it aligned with the headset's orientation for a more natural VR interaction.
+
+- **Freeze Rotation:** Added an optional camera rotation lock. When enabled, the camera remains fixed in its current orientation while the right analog stick rotates Miles's body independently, allowing movement in different directions without changing the camera's orientation.
+
+---
 
 ## Picture Quality and Upscaling
 
@@ -181,44 +227,6 @@ This setting only applies in AUTO eye-resolution mode. In MANUAL you choose the 
 | You dislike any sharpening halo   | 100%              | **CLASSIC**, Sharpening 0                                     |
 
 One interaction worth knowing: raising **Edge margin** (`[Stream] EdgeOverscanDeg`) spreads the same pixel budget over more degrees in order to remove the black bars on a fast head turn. That costs sharpness by design, so if the picture looks soft after turning Edge margin up, raise the render resolution rather than the sharpening.
-
----
-
-# Improvements & Fixes
-
-## 1. Bug Fixes
-
-- **Shortcut Fixes:** Corrected shortcut assignments.
-
-- **Camcorder Positioning:** Fixed incorrect camcorder positioning and alignment.
-
-- **Door Closing Controls:** Fixed an issue that caused door-closing input to be registered unreliably.
-
-- **Lens Flare Rendering:** Fixed an issue that caused lens flare effects to remain visible through walls.
-
-- **Input Reliability:** Improved the reliability of jump and door interaction inputs to prevent occasional missed button presses. This improvement has not yet been fully tested.
-
-## 2. Gameplay Improvements
-
-- **Door Interaction:** Improved hand positioning and grip on door handles, added angular acceleration to door movement, and made doors easier to open. Door opening and closing sounds were also added.
-
-- **Camcorder Handling:** Introduced a hybrid mode that allows players to hold the camcorder up to their face or lock it in position without physically holding it.
-
-- **Head Bob Removal:** Removed head bobbing using a standalone patcher.
-
-- **Camcorder HUD:** Redesigned the camcorder display to closely match the original game's HUD, with multiple customization options available in the launcher.
-
-- **Battery Reload Animation:** Fixed the initial animation skip when starting a battery reload, ensuring the reload animation plays from the beginning.
-
-## 3. New Features
-
-- **Manual Battery Reloading:** Added physical battery interaction, allowing players to grab a replacement battery from Miles's left hip and bring it to the camcorder to reload.
-
-- **Physical Document Interaction:** Added physical document handling, allowing players to grab the document folder from Miles's left shoulder and open the document menu by looking at it for a few seconds.
-
-- **Head-Relative Menu Positioning:** The menu now dynamically follows the direction the player is looking, keeping it aligned with the headset's orientation for a more natural VR interaction.
-
-- **Freeze Rotation:** Added an optional camera rotation lock. When enabled, the camera remains fixed in its current orientation while the right analog stick rotates Miles's body independently, allowing movement in different directions without changing the camera's orientation.
 
 ---
 
