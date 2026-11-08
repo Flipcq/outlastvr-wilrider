@@ -1,0 +1,292 @@
+﻿"""Compile actual mouse adapter, XR wiring, mapper, XInput hook and hint rewrite.
+Windows/game APIs are synthetic: this does not prove native mouse acceptance.
+Run: python3 tests/mouse_use_test.py (g++ required).
+"""
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[1]
+proxy = (ROOT / 'src/d3d9_proxy.cpp').read_text()
+xr = (ROOT / 'src/ol_xr.cpp').read_text()
+prompts = (ROOT / 'src/ol_prompts.cpp').read_text()
+menu = (ROOT / 'src/ol_menu.cpp').read_text()
+mouse_hook = menu[menu.index('static LRESULT CALLBACK LLMouseProc('):menu.index('static DWORD WINAPI InputThread(')]
+adapter = proxy[proxy.index('// [MOUSEUSE] The requested'):proxy.index('// OpenXR and UE3/XInput are sampled')]
+mapping = proxy[proxy.index('static WORD ReliablePadButtons('):proxy.index('// [HANDCAM] Right grip')]
+hook = proxy[proxy.index('static DWORD WINAPI Hook_XiGetState('):proxy.index('// [HAPTICS] XInputSetState')]
+# The one call, not the block around it: the [PADLATCH] lines that follow it are checked by tests/pad_press_test.py.
+wiring_line = '    OLProxy_MouseUseSample(p.buttons, p.gripL, r == XR_SUCCESS_VALUE, 0);'
+wiring = xr[xr.index(wiring_line):xr.index(wiring_line) + len(wiring_line)]
+rewrite = prompts[prompts.index('struct ActionWord'):prompts.index('// The first few distinct rewrites')]
+interact = (ROOT / 'src/ol_interact.cpp').read_text()
+drop = interact[interact.index('            const bool dropDown ='):interact.index(';', interact.index('            const bool dropDown =')) + 1]
+STUBS = r'''
+#include "ol_mouse_use.h"
+#include <cassert>
+#include <cmath>
+#include <cstring>
+#include <cstdint>
+#include <cwchar>
+#include <cwctype>
+#include <cstdio>
+#include <cstdarg>
+#include <vector>
+#include <string>
+#define WINAPI
+#define _countof(a) (sizeof(a)/sizeof(a[0]))
+#define ZeroMemory(p,n) memset(p,0,n)
+#define _wcsnicmp wcsncasecmp
+using WORD=unsigned short; using BYTE=unsigned char; using SHORT=short;
+using DWORD=unsigned long; using LONG=long; using ULONGLONG=unsigned long long;
+using XrResult=int;
+static constexpr int XR_SUCCESS_VALUE=0, INPUT_MOUSE=0, MOUSEEVENTF_LEFTDOWN=2,
+    MOUSEEVENTF_LEFTUP=4, VK_LBUTTON=1, ERROR_SUCCESS=0, ERROR_DEVICE_NOT_CONNECTED=1167;
+static ULONGLONG now=1000;
+static ULONGLONG GetTickCount64() { return now; }
+static DWORD GetTickCount() { return DWORD(now); }
+struct INPUT { unsigned type; struct { unsigned dwFlags; unsigned long dwExtraInfo; } mi; };
+struct SRWLOCK { bool locked=false; };
+#define SRWLOCK_INIT {}
+static void AcquireSRWLockExclusive(SRWLOCK* l) { assert(!l->locked); l->locked=true; }
+static void ReleaseSRWLockExclusive(SRWLOCK* l) { assert(l->locked); l->locked=false; }
+static bool TryAcquireSRWLockExclusive(SRWLOCK* l) { if(l->locked)return false; l->locked=true; return true; }
+static LONG InterlockedExchange(volatile LONG* p,LONG n) { LONG old=*p; *p=n; return old; }
+static LONG InterlockedIncrement(volatile LONG* p) { return ++*p; }
+static int g_gameWnd=1, foreground=1;
+// [RELOAD] the d3d9 proxy's own "the mod handles Y" switch, read by the extracted pad mapping.
+static bool g_yHandled = false;
+static int GetForegroundWindow() { return foreground; }
+static bool modMenu=false, gameMenu=false, gameplay=true, physicalMouse=false;
+static int OLMenu_Visible() { return modMenu; }
+extern "C" int OLUE3_InGameMenu() { return gameMenu; }
+extern "C" int OLUE3_GameplayActive() { return gameplay; }
+static short GetAsyncKeyState(int) { return physicalMouse ? short(0x8000) : 0; }
+static bool failDown=false, failUp=false;
+static std::vector<bool> events;
+static unsigned attempts=0;
+static unsigned SendInput(unsigned count,INPUT* in,int size) {
+    assert(count==1 && size==sizeof(INPUT) && in->type==INPUT_MOUSE);
+    assert(in->mi.dwExtraInfo==OLMouseUse::InputTag);
+    const bool down=in->mi.dwFlags==MOUSEEVENTF_LEFTDOWN;
+    assert(down || in->mi.dwFlags==MOUSEEVENTF_LEFTUP); ++attempts;
+    if(down ? failDown : failUp) return 0;
+    events.push_back(down); return 1;
+}
+static std::vector<std::string> logs;
+static void Log(const char* fmt,...) { char s[1024]; va_list ap;va_start(ap,fmt);vsnprintf(s,sizeof(s),fmt,ap);va_end(ap);logs.emplace_back(s); }
+#define XLOG Log
+static bool g_camcorderUp=false,g_nvRequested=false;
+static constexpr ULONGLONG OLVR_CAM_HOLD_MS=800;
+static LONG g_menuChordLatch=0;
+static OLXrPad published={};
+static bool motionReady=true,padReady=true;
+extern "C" int OLXR_MotionControlsReady() { return motionReady; }
+extern "C" int OLXR_GetPad(OLXrPad* p) { if(!padReady)return 0;*p=published;return 1; }
+struct OLXiGamepad { WORD wButtons; BYTE bLeftTrigger,bRightTrigger; SHORT sThumbLX,sThumbLY,sThumbRX,sThumbRY; };
+struct OLXiState { DWORD dwPacketNumber; OLXiGamepad Gamepad; };
+static volatile LONG g_padPollsAll=0,g_padPolls0=0,g_padRealOk=0,g_padFaked=0;
+static bool g_padStub=false,realConnected=false;
+static WORD realButtons=0;
+static DWORD RealPad(DWORD,OLXiState* p) { ZeroMemory(p,sizeof(*p));p->Gamepad.wButtons=realButtons;return realConnected?ERROR_SUCCESS:ERROR_DEVICE_NOT_CONNECTED; }
+static auto o_XiGetState=&RealPad;
+struct OLInteractPad { int camUp; bool blockGripL,blockGripR; WORD addButtons, removeButtons; bool stickOn; float stickLX,stickLY; };
+static int OLDev_Pad(WORD*,float*,float*,float*,float*) { return 0; }
+static void OLInteract_Pad(const OLXrPad&,OLInteractPad* p) { p->camUp=-1; }
+static WORD CamcorderGripButton(const OLXrPad&) { return 0; }
+static WORD OLMotion_Process(const OLXrPad&,bool,float*,float*,float*,float*) { return 0; }
+static void OLInteract_FilterMoveStick(float*,float*) {}
+static SHORT StickAxis(float v) { return SHORT(v*32767); }
+static int OLInteract_Get(int) { return 1; }
+static int OLInteract_ClimbMode() { return 0; }   //  the hint gate asks for the climb mode
+static int OLMotion_GetPhysCrouch() { return 1; }
+'''
+MENU_STUBS = r'''
+#define CALLBACK
+#define HIWORD(x) (((x)>>16)&0xffff)
+using LRESULT=long;using WPARAM=unsigned;using LPARAM=intptr_t;
+struct POINT { long x,y; };
+struct MSLLHOOKSTRUCT { POINT pt; unsigned long mouseData, flags, dwExtraInfo; };
+static constexpr int HC_ACTION=0,LLMHF_INJECTED=1,
+ WM_MOUSEMOVE=0x200,WM_LBUTTONDOWN=0x201,WM_LBUTTONUP=0x202,
+ WM_RBUTTONDOWN=0x204,WM_RBUTTONUP=0x205,WM_MOUSEWHEEL=0x20a,
+ WM_MBUTTONDOWN=0x207,WM_MBUTTONUP=0x208;
+static bool g_visible=false;
+static int g_llHook=1;
+static long g_mouseMoved=0,g_lBtn=0,g_rBtn=0,g_wheel=0;
+static float g_curX=0,g_curY=0;
+static constexpr int kRTW=100,kRTH=100;
+static POINT g_center={};
+static void SetCursorPos(long,long) {}
+static void InterlockedExchangeAdd(volatile long* p,long v) { *p+=v; }
+static LRESULT CallNextHookEx(int,int,WPARAM,LPARAM) { return 42; }
+'''
+WRAPPERS = r'''
+static void Publish(unsigned buttons=0,float grip=0,int focus=1,float trig=0) {
+    OLXrPad p={}; p.buttons=buttons;p.gripL=grip;p.trigL=trig;
+    const XrResult r=focus?0:8;
+''' + wiring + r'''
+    published=p;
+}
+static bool DropRequested() { OLXrPad pp={};
+''' + drop + r'''
+    return dropDown;
+}
+static WORD Poll() { OLXiState s={}; assert(Hook_XiGetState(0,&s)==ERROR_SUCCESS);return s.Gamepad.wButtons; }
+static void Idle() { now+=300;Publish();Poll(); }
+static void Hint(const wchar_t* text,const wchar_t* expected) {
+    wchar_t out[2048]; assert(Rewrite(text,wcslen(text),out,2048)); assert(wcscmp(out,expected)==0);
+}
+'''
+CASES = r'''
+int main() {
+    setvbuf(stdout,nullptr,_IONBF,0);
+    Idle(); events.clear();
+    // Source tap entirely between two game polls: ordered mouse edges survive,
+    // without a buffer tail or any fabricated gamepad Use/crouch for B.
+    now+=11; Publish(OLXR_BTN_B); now+=11;Publish();
+    assert((events==std::vector<bool>{true,false}));assert(Poll()==0);
+    events.clear();now+=200;Publish(OLXR_BTN_B);assert(Poll()==0);
+    now+=2000;Publish(OLXR_BTN_B);assert(Poll()==0 && events.size()==1);
+    Publish();assert((events==std::vector<bool>{true,false}));
+    puts("PASS: raw short/held B, no mouse tail, no duplicate gamepad action");
+
+    Idle();events.clear();Publish(OLXR_BTN_X);assert(Poll()==0x2000 && DropRequested());
+    now+=11;Publish();assert(Poll()==0x2000); // retain the base gamepad extension for crouch
+    now+=100;Publish();assert(Poll()==0);assert(events.empty());
+    Idle();Publish(OLXR_BTN_A|OLXR_BTN_Y);assert(Poll()==0x9000);
+    //  the notebook shortcuts, one game action each:
+    //   left grip + Y = DOCUMENTS   - D-pad right (ShowEvidenceMenu), 0x0008
+    //   left grip + X = NOTES       - D-pad left  (ShowRecordingMenu), 0x0004
+    //   left trigger + Y = the notebook menu that holds both - Back (ShowTabMenu), 0x0020
+    // The left grip is still sprint (LB, 0x0100), and a chord never also crouches or reloads.
+    Idle();Publish(OLXR_BTN_X,1);assert(Poll()==0x0104 && !DropRequested());
+    Idle();Publish(OLXR_BTN_Y,1);assert(Poll()==0x0008);
+    Idle();Publish(OLXR_BTN_X,1);assert(Poll()==0x0104);        // and holding it does not wander
+    Idle();Publish(OLXR_BTN_Y);assert(Poll()==0x8000);          // let go of the grip: Y reloads again
+    Idle();Publish(OLXR_BTN_Y,0,1,1);assert(Poll()==0x0020);    // left trigger + Y = the notebook
+    Idle();Publish(OLXR_BTN_X,0,1,1);assert(Poll()==0x2000);    // ...but the trigger leaves X alone
+    Idle();Publish(OLXR_BTN_Y,1,1,1);assert(Poll()==0x0008);    // grip wins Y when both are held
+    //  [MOUSEUSE] ...and Use is NOT silent under the sprint any more. The old rule was written
+    // for the removed 1.1.4 chords, and what it did in practice was swallow the Use of every player holding
+    // the left grip - i.e. sprinting - so "opening a door does not work every time". Sprint and Use now
+    // travel together, exactly as a player expects when they run at a door.
+    Idle();events.clear();Publish(OLXR_BTN_B,1);assert(Poll()==0x0100);
+    assert((events==std::vector<bool>{true}) && g_mouseUseState.held);
+    Publish();assert((events==std::vector<bool>{true,false}));
+    // The only grip that still silences Use is the one the MOD owns this frame (a door handle, a ledge, a
+    // battery): the hands-on door has already told the game to open, so a Use on top would close it again.
+    Idle();events.clear();OLProxy_SetLeftGripOwned(1);Publish(OLXR_BTN_B,1);
+    assert(events.empty() && !g_mouseUseState.held);
+    // A press that began while Use was blocked never becomes a delayed click: the player lets go and
+    // presses again - and then it is theirs.
+    OLProxy_SetLeftGripOwned(0);Publish();Publish(OLXR_BTN_B,1);
+    assert((events==std::vector<bool>{true}));
+    Idle();assert((events==std::vector<bool>{true,false}));
+    // Taking a grip mid-press ends the Use, and releasing that grip does not turn into a new click.
+    events.clear();OLProxy_SetLeftGripOwned(1);Publish(OLXR_BTN_B,1);Publish(OLXR_BTN_B,0);assert(events.empty());
+    OLProxy_SetLeftGripOwned(0);
+    Idle();Publish(OLXR_BTN_B);assert(events.size()==1);
+    Publish();assert((events==std::vector<bool>{true,false}));   // let go: one click, one release
+    puts("PASS: X crouch, gamepad timing, A/Y, grip+Y, and Use under sprint but not under a mod-owned grip");
+
+    Idle();events.clear();gameMenu=true;Publish();Poll();
+    Publish(OLXR_BTN_B);assert(Poll()==0x2000);assert(events.empty());
+    gameMenu=false;Publish(OLXR_BTN_B);assert(Poll()==0 && events.empty());
+    Idle();gameMenu=true;Publish();Poll();Publish(OLXR_BTN_X);assert(Poll()==0x4000);
+    gameMenu=false;Publish(OLXR_BTN_X);assert(Poll()==0);
+    now+=200;Publish(OLXR_BTN_X);assert(Poll()==0);Idle();
+    Publish(OLXR_BTN_X);assert(Poll()==0x2000);
+    gameMenu=true;Publish(OLXR_BTN_X);assert(Poll()==0); // no menu activation from held crouch
+    Idle();gameMenu=false;Publish();Poll();
+    modMenu=true;Publish(OLXR_BTN_B);assert(Poll()==0 && events.empty());
+    modMenu=false;Publish(OLXR_BTN_B);assert(events.empty());Idle();
+    modMenu=true;Publish(OLXR_BTN_X);assert(Poll()==0);
+    modMenu=false;Publish(OLXR_BTN_X);assert(Poll()==0);Idle();
+    puts("PASS: game-menu original B/X, mod menu, held-button context boundaries");
+
+    // Focus loss and XR/dashboard loss release and require a fresh press.
+    events.clear();Publish(OLXR_BTN_B);foreground=2;MouseUseWatchdog();
+    assert((events==std::vector<bool>{true,false}));foreground=1;
+    Publish(OLXR_BTN_B);assert(events.size()==2);Idle();
+    Publish(OLXR_BTN_B);OLProxy_MouseUseSample(0,0,0,1);
+    Publish(OLXR_BTN_B);assert(events.size()==4);Idle();
+    Publish(OLXR_BTN_B);now+=201;MouseUseWatchdog();
+    assert(events.size()==6);Publish(OLXR_BTN_B);assert(events.size()==6);Idle();
+    Publish(OLXR_BTN_B);gameMenu=true;MouseUseWatchdog();assert(events.size()==8);
+    gameMenu=false;Publish(OLXR_BTN_B);assert(events.size()==8);Idle();
+    gameplay=false;Publish(OLXR_BTN_B);gameplay=true;Publish(OLXR_BTN_B);assert(events.size()==8);Idle();
+    physicalMouse=true;Publish(OLXR_BTN_B);physicalMouse=false;Publish(OLXR_BTN_B);assert(events.size()==8);Idle();
+    Publish(OLXR_BTN_B);gameplay=false;Publish(OLXR_BTN_B);assert(g_mouseUseState.held);
+    Publish();gameplay=true;assert(events.size()==10); // preserve hold across door animation
+    puts("PASS: focus, XR loss, stale producer, menus, native animation, physical mouse ownership");
+
+    events.clear();failDown=true;Publish(OLXR_BTN_B);assert(!g_mouseUseState.held);
+    failDown=false;Publish(OLXR_BTN_B);assert(events.empty());Idle();
+    Publish(OLXR_BTN_B);failUp=true;Publish();assert(g_mouseUseState.held);
+    failUp=false;Publish(OLXR_BTN_B);assert(!g_mouseUseState.held); // retries pending up even under a new press
+    assert((events==std::vector<bool>{true,false}));Idle();
+    Publish(OLXR_BTN_B);failUp=true;Publish();failUp=false;MouseUseWatchdog();assert(!g_mouseUseState.held);Idle();
+    puts("PASS: failed down is not replayed, failed up ownership and retry");
+
+    // Original pad bits are additive, independent of the new VR layout.
+    events.clear();realConnected=true;realButtons=0x4000;
+    Publish(OLXR_BTN_B);assert(Poll()==0x4000);Publish();
+    assert((events==std::vector<bool>{true,false}));realConnected=false;realButtons=0;Idle();
+    g_mouseUse=0;events.clear();Publish(OLXR_BTN_X);assert(Poll()==0x4000);
+    Idle();Publish(OLXR_BTN_B);assert(Poll()==0x2000 && events.empty() && DropRequested());Idle();
+    puts("PASS: real gamepad preserved and MouseUse=0 legacy layout");
+
+    g_mouseUse=1;
+    Hint(L"Pressione {OLA_Use} para fechar",L"Pressione (B) para fechar");
+    Hint(L"Press {OLA_CrouchToggle}",L"Press X");
+    Hint(L"Press {OLA_Crouch}",L"Press X");
+    Hint(L"Press {OLA_ShowTabMenu}",L"Press left trigger + Y");
+    Hint(L"Press {OLA_ShowRecordingMenu}",L"Press left grip + X");
+    Hint(L"Press {OLA_ShowEvidenceMenu}",L"Press left grip + Y");
+    //  the door prompts are GONE - doors open by hand - so the game's "press Use to
+    // close" line is rewritten to nothing in either layout (the Portuguese line is not one of the
+    // game's English sentences, so it keeps the ordinary button rewrite).
+    Hint(L"Press {OLA_Use} to close",L"");
+    gameMenu=true;Hint(L"Press {OLA_Use}",L"Press X");Hint(L"Press {OLA_CrouchToggle}",L"Press B");
+    gameMenu=false;g_mouseUse=0;Hint(L"Press {OLA_Use} to close",L"");
+    puts("PASS: localized Use/crouch hints, door prompts dropped, notebook shortcuts and menu/legacy text");
+
+    // Actual settings-menu low-level hook must pass our cancellation release,
+    // while original physical and other injected clicks still drive its cursor.
+    g_visible=true;MSLLHOOKSTRUCT event={};event.flags=LLMHF_INJECTED;
+    event.dwExtraInfo=OLMouseUse::InputTag;
+    assert(LLMouseProc(HC_ACTION,WM_LBUTTONUP,reinterpret_cast<LPARAM>(&event))==42);
+    assert(g_lBtn==0);
+    event.dwExtraInfo=0;
+    assert(LLMouseProc(HC_ACTION,WM_LBUTTONDOWN,reinterpret_cast<LPARAM>(&event))==1 && g_lBtn==1);
+    event.flags=0;
+    assert(LLMouseProc(HC_ACTION,WM_LBUTTONUP,reinterpret_cast<LPARAM>(&event))==1 && g_lBtn==0);
+    g_visible=false;
+    puts("PASS: tagged owned releases pass the real menu hook; original menu mouse controls preserved");
+
+    g_mouseUse=1;Idle();Publish(OLXR_BTN_B);const auto n=logs.size();
+    OLProxy_MouseUseShutdown();assert(!g_mouseUseHeld && !g_mouseUseState.held && logs.size()==n);
+    Publish(OLXR_BTN_B);assert(!g_mouseUseState.held);
+    // Busy worker during shutdown: the loader-lock path does not wait or log.
+    g_mouseUseStopping=0;Idle();Publish(OLXR_BTN_B);AcquireSRWLockExclusive(&g_mouseUseLock);
+    OLProxy_MouseUseShutdown();assert(!g_mouseUseHeld);ReleaseSRWLockExclusive(&g_mouseUseLock);
+    Publish();assert(!g_mouseUseState.held);
+    puts("PASS: shutdown release, stopped input, nonblocking shutdown fallback");
+}
+'''
+# Compile the actual raw source call before publication, without the previous
+# experimental source buffer or diagnostics.
+assert wiring.strip() == 'OLProxy_MouseUseSample(p.buttons, p.gripL, r == XR_SUCCESS_VALUE, 0);'
+assert 'MapPadButtons(pg, inMenu)' in hook
+assert 'MouseUseWatchdog();' in proxy[proxy.index('static DWORD WINAPI KeyThread'):]
+assert 'OLProxy_MouseUseShutdown();\n        OLXR_Shutdown();' in proxy
+with tempfile.TemporaryDirectory(prefix='outlast-mouse-use-') as tmp:
+    cpp = Path(tmp) / 'test.cpp'
+    binary = Path(tmp) / 'test'
+    cpp.write_text(STUBS + adapter + mapping + hook + rewrite + MENU_STUBS + mouse_hook + WRAPPERS + CASES)
+    subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                    '-I', str(ROOT / 'src'), str(cpp), '-o', str(binary)], check=True)
+    raise SystemExit(subprocess.run([str(binary)]).returncode)
+

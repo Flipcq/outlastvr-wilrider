@@ -1,0 +1,181 @@
+// OutlastVR Walrider - a free PC VR mod for Outlast (2013).
+// Copyright (C) 2026 the Outlast VR authors.
+//
+// A fork of OutlastVR by StrikeZoneVR (https://github.com/StrikeZoneVR-hub/OutlastVR),
+// distributed under the same terms. Not affiliated with or endorsed by StrikeZoneVR.
+// Outlast is a game by Red Barrels; this mod contains no game files.
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version. It is distributed WITHOUT ANY WARRANTY; without even the implied
+// warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License in LICENSE for details.
+//
+#pragma once
+// ol_interact.h - [INTERACT] (Test37/38) physical doors, the camcorder's chest holster, raise-to-eye,
+// the camcorder viewfinder, how-to labels and the developer markers.
+#include "ol_xr.h"
+#include "ol_camcorder_hud.h"
+
+//  [FACECAM] How long the right stick click is held before it raises / lowers the
+// camcorder at his face. A shorter click stays the night-vision switch it always was. Shared with
+// d3d9_proxy.cpp, which withholds the game's night-vision press until it knows the click was short.
+constexpr ULONGLONG OLVR_CAM_HOLD_MS = 500;
+
+void OLInteract_Init();                      // reads [Motion] from outlastvr.ini; call once at startup
+void OLInteract_Save(const wchar_t* ini);
+
+// Game thread, once per frame at the end of the CPU split (after the frame's head pose is committed).
+extern "C" void OLInteract_Tick();
+
+// Game thread, from the XInput hook: buttons to add this poll, buttons the game must NOT see, grips the
+// game must not see (a grip that is grabbing a door knob, a battery or the camcorder is not sprint /
+// camcorder), and the camcorder's real state (-1 = not known yet).
+//  removeButtons: PHYSICAL climbing keeps the jump button from finishing a climb - it only
+// jumps at a ledge - so its A is taken out of the pad again here (0x1000 = XInput A).
+// (Test40) stickOn/stickLX/stickLY: the left stick the hands ask for - on a ladder, forward to climb
+// to where your hand pulled; a pull on an edge, a step into it (used only while your own stick is centred).
+struct OLInteractPad { unsigned short addButtons, removeButtons; bool blockGripL, blockGripR; int camUp; bool stickOn; float stickLX, stickLY; };
+extern "C" void OLInteract_Pad(const OLXrPad& p, OLInteractPad* out);
+
+// 0 = no viewfinder, else the camcorder zoom factor (0..1] while the zoomed picture should be shown
+// in the head-locked viewfinder. Any thread.
+extern "C" float OLInteract_ViewfinderZoom();
+// The right arm should play the game's own camcorder animation instead of following the controller.
+extern "C" int OLInteract_RightArmNative();
+//  [FACECAM] The camcorder is pinned at Miles's face by a held right stick click: let the
+// game's own raise / lower arm animation play (instead of the tucked empty hand used at the eye).
+extern "C" int OLInteract_FaceCamPinned();
+// (V1) [FACECAM] While Miles's own arm plays the camcorder at his face - pinned at the face, or while
+// the game is raising/lowering it - so the controller hand is hidden and Miles's raise / lower
+// animation is visible instead of being overridden by the tracked hand.
+extern "C" int OLInteract_FaceCamBusy();
+// [FACECAM] The camcorder is physically held in the hand at Miles's face (s_hState == H_IN_HAND
+// while the game still reports s_camUp == 1): the hand must be hidden so only the camera screen shows.
+extern "C" int OLInteract_CamInHandAtFace();
+// [FACECAM] Is the startup camcorder guard over? (used by the arm solver's diagnostic log)
+extern "C" int OLInteract_CamStarted();
+
+// [HOLSTER] (Test38) What to do with the game's handycam model this frame. Game thread.
+//   mode 0: leave it to the game (holster off, menus, cutscenes)
+//   mode 1: show it, `blend` of the way from the chest holster (0) to the right hand (1)
+//   mode 2: hide it (it is at your eye - you are looking through it)
+// holsterRel: the holster relative to the tracked head (recenter frame, metres, +x right, +y up,
+// +z back); torsoFwd: the estimated body facing (x, z) in the same frame.
+struct OLCamVisual { int mode; float blend; float holsterRel[3]; float torsoFwd[2]; };
+extern "C" int OLInteract_CamVisual(OLCamVisual* v);
+// [DOORGRIP] (Test39) how closed each hand is round a door handle (0 open .. 1 the grip), eased.
+extern "C" void OLInteract_HandGrip(float w[2]);
+
+// [BATTERY]  The spare battery's visual. It sits on Miles's left hip while it is
+// holstered (hidden), glides into the left hand while held, and fades back to the hip during a
+// reload. `blend` is 0 on the hip .. 1 in the hand, `alpha` fades it out.
+struct OLBatteryVisual { int mode; float blend; float alpha; float hipRel[3]; float torsoFwd[2]; };
+extern "C" int OLInteract_BatteryVisual(OLBatteryVisual* v);
+// [DOCUMENT]  The confidential document on Miles's left shoulder: invisible while it
+// rests there (hidden), glides into the left hand while held, and returns to the shoulder when
+// released or read. `blend` is 0 on the shoulder .. 1 in the hand, `alpha` fades it out.
+struct OLDocumentVisual { int mode; float blend; float alpha; float shoulderRel[3]; float torsoFwd[2]; };
+extern "C" int OLInteract_DocumentVisual(OLDocumentVisual* v);
+// [DOCUMENT] the document is held in the left hand (the arm solver turns the wrist a little for it).
+extern "C" int OLInteract_DocumentHeld();
+// While the game's own camcorder reload animation plays: both arms follow the animation, not the
+// controllers, and the pad grips are held back.
+extern "C" int OLInteract_ReloadNative();
+// [BATTERY] how much of the arm solve to keep while the reload animation takes over: 1 (full IK) at
+// the start, fading to 0 (full animation) so the arms do not snap when the animation begins.
+extern "C" float OLInteract_ReloadBlend();
+// [BATTERY] the spare cell's in-hand placement: off = forward, right, up (uu); rot = roll, pitch, yaw (deg).
+extern "C" void OLInteract_GetBatteryAdjust(float off[3], float rot[3]);
+extern "C" void OLInteract_SetBatteryAdjust(const float off[3], const float rot[3]);
+extern "C" void OLInteract_ResetBatteryAdjust();
+// [DOCUMENT] the confidential document's in-hand placement: off = forward, right, up (uu); rot = roll, pitch, yaw (deg).
+extern "C" void OLInteract_GetDocumentAdjust(float off[3], float rot[3]);
+extern "C" void OLInteract_SetDocumentAdjust(const float off[3], const float rot[3]);
+extern "C" void OLInteract_ResetDocumentAdjust();
+// [DOCUMENT] (V1) the left wrist's turn while it holds the document (deg): a forearm twist at the
+// wrist. The hand and the paper keep their placement - only the wrist turns.
+extern "C" float OLInteract_GetDocumentWrist();
+extern "C" void  OLInteract_SetDocumentWrist(float deg);
+extern "C" void  OLInteract_ResetDocumentWrist();
+// [DOCWRIST] live tuning from the in-game menu: degrees about the actor's X (forward), Y (right),
+// Z (up), applied at the wrist joint. Any non-zero value stands the automatic lift down.
+extern "C" void  OLInteract_GetDocumentWristRot(float out[3]);
+extern "C" void  OLInteract_SetDocumentWristRot(const float in[3]);
+extern "C" void  OLInteract_ResetDocumentWristRot();
+extern "C" void  OLInteract_LogDocumentWrist();
+// [BATTERY] play the reload animation once without swapping batteries (menu tuning).
+extern "C" void  OLInteract_PreviewReload();
+
+// [ANCHOR] (Test40) the world point (uu) where a hand holds - a climbable edge, a door handle, the door
+// panel it pushes - and the weight (0..1, eased) of the hold.  The weight arrives as the
+// smoothstep of the hold: the arm solver treats the published point as the hand's POSITION for that
+// fraction (it must not apply the weight to it a second time), so weight 1 is exactly the anchor and 0
+// is exactly the controller. A gap from the real hand is represented by mixing the point towards the
+// controller, not by lowering the weight.
+extern "C" float OLInteract_HandAnchorWorld(int h, float out[3]);
+// [DOOR] while this hand holds a knob its wrist is pinned to the door: it turns with the swing (yaw, deg)
+// instead of following the controller. 1 while the wrist is locked.
+extern "C" int   OLInteract_HandAnchorLock(int h);
+extern "C" float OLInteract_HandAnchorYaw(int h);
+// [DOOR] 1 while this hand has a grip closed on a door KNOB (not an open hand on the panel,
+// not a ledge or a rung). The arm solver takes its blend ramp straight to 1 for that hand, so the hand is
+// on the handle from the grab frame instead of easing onto it.
+extern "C" int   OLInteract_HandAnchorKnob(int h);
+// [CLIMB] (Test40) In a climb / ledge hang / on a ladder this hand holds on: it plays the game's own arm.
+// [CLIMB] PHYSICAL: Miles's automatic left-hand grab also plays the game's own pose until the grip
+// takes it over; a released hand goes back to the tracked, open hand.
+extern "C" int OLInteract_ClimbHold(int h);
+// [CLIMBFINISH]  PHYSICAL: the hands lifted Miles to the top and the game was asked to finish
+// the climb with its own animation. 1 while that is happening, so ol_ue3 lets the game pose both arms.
+extern "C" int OLInteract_ClimbFinishing();
+// [LADDERGRAB] (Test41) Remove the part of a walk stick (pawn frame: x right, y forward) that would push
+// Miles onto a ladder no hand has taken.
+extern "C" void OLInteract_FilterMoveStick(float* x, float* y);
+// [AIMASSIST] (phase 8) the point a single interaction ray should bend toward: the nearest knob of a
+// door the game itself would let you use, inside the caller's cone. 0 = nothing to bend toward, and
+// the caller then leaves the aim exactly as it was. Read on the game thread, from the same scan that
+// already runs every frame, so it costs no new object walk.
+extern "C" int OLInteract_AimAssistTarget(const float headWorld[3], const float fwd[3],
+                                          float maxDistUU, float coneDeg, float out[3]);
+
+// 0 doors, 1 raise gesture, 2 viewfinder, 3 markers, 4 Quest prompts, 5 hip holster,
+// 6 how-to labels, 7 (Test40) climbing with your hands, 8 (Test43) the camcorder's live screen,
+// 9 (Test43) cover your mouth, 10 (Test44) walk around for real (roomscale: Miles walks with you),
+// 11 (Test46) the camcorder zoom in a framed viewfinder (0: the zoomed picture fills the view),
+// 12  auto ledge grab: in the air the game catches the edge (physical climbing steps aside)
+extern "C" int  OLInteract_Get(int which);
+extern "C" void OLInteract_Set(int which, int on);
+//  The three ways to climb: 0 = A BUTTON (the game's climb, the default), 1 = HYBRID (your
+// hands climb AND the button still works), 2 = PHYSICAL (your hands only - A only jumps at a ledge, the game
+// finishes the climb near the top, and the walk stick only walks you to a ladder, backs you down it and steps
+// you off the top). A saved 1 from the older builds (the guided climb, since removed) reads as HYBRID.
+// The camcorder in your hand: 4 free hold, 3 the game's raise pose.
+extern "C" int  OLInteract_ClimbMode();
+extern "C" void OLInteract_SetClimbMode(int m);
+extern "C" int  OLInteract_CamHold();
+// [CAMHUD] coherent game-thread snapshot consumed by the XR compositor.
+extern "C" int OLInteract_CamcorderHud(OLCamcorderHudState* state);
+extern "C" int OLInteract_GetCamcorderHud();
+extern "C" void OLInteract_SetCamcorderHud(int on);
+extern "C" void OLInteract_CamcorderHudSubmitted(int shown);
+// [CAMHUD] (phase 8) worker-side menu check: hides the HUD on the frame the menu opens, without
+// waiting for the game thread's next tick.
+extern "C" void OLInteract_RefreshCamHudMenu();
+extern "C" void OLInteract_SetCamHold(int m);
+// (Test49) [CAMBUTTON] 1 = the right grip is a camcorder button (raise / lower), the view stays the head's
+extern "C" int  OLInteract_CamButton();
+extern "C" void OLInteract_SetCamButton(int on);
+// (Test45) [CAMADJUST] the camcorder in your hand: rot = tilt, turn, roll (deg); off = forward, up, right (cm)
+extern "C" void OLInteract_GetCamAdjust(float rot[3], float off[3]);
+extern "C" void OLInteract_SetCamAdjust(const float rot[3], const float off[3]);
+//  [DOOR] the hand-on-knob trim (up, toward the door, sideways in uu) and the two
+// collision numbers: how far an open wrist is kept off a panel, and how close a hand must be to grab.
+extern "C" void OLInteract_GetHandPlacement(float* depth, float* reach);
+extern "C" void OLInteract_SetHandPlacement(float depth, float reach);
+extern "C" void OLInteract_ResetHandPlacement();
+// [ROOMWALK] (Test44) Game thread, from the player tick after the frame latch: Miles takes the room steps
+// of this frame's pose.
+extern "C" void OLInteract_RoomWalkStep();
+

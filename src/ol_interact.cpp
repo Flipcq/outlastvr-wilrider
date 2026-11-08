@@ -1,0 +1,3993 @@
+// OutlastVR Walrider - a free PC VR mod for Outlast (2013).
+// Copyright (C) 2026 the Outlast VR authors.
+//
+// A fork of OutlastVR by StrikeZoneVR (https://github.com/StrikeZoneVR-hub/OutlastVR),
+// distributed under the same terms. Not affiliated with or endorsed by StrikeZoneVR.
+// Outlast is a game by Red Barrels; this mod contains no game files.
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version. It is distributed WITHOUT ANY WARRANTY; without even the implied
+// warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License in LICENSE for details.
+//
+// ol_interact.cpp - [INTERACT] (Test37/38) native-VR interactions
+// =============================================================================
+// DOORS     Squeeze grip on a door knob and the door swings with your hand; let go to leave it.
+//           (Test39) Or just push: an open hand against the door panel moves it as far as your hand
+//           goes, slowly or all at once, Boneworks-style. A hand on a handle closes into a grip.
+//           OLDoor's own tick follows TargetOpenRatio (proven live: writing it opened a door
+//           smoothly, no Use press, no animation), so the hand only ever sets that. Locked doors
+//           buzz and their marker flashes red. Lockers and scripted doors are left to the game.
+// HOLSTER   (Test38, hip since Test39) The camcorder lives on your right hip. Reach there with the right hand and squeeze:
+//           it glides into your hand (the game's own handycam model, placed by ol_ue3 [HOLSTER]).
+//           Bring it to your eye and you look through it; take it away and it is back in your
+//           hand. Open your hand anywhere and it glides back to the hip.
+//           Without the holster ([Motion] CamcorderHolster=0) Test37's raise-to-eye gesture and
+//           the right-grip toggle are used instead.
+// RELOAD    The spare cell lives on your left hip. Squeeze the left grip there to take
+//           it; let go and it is back. With the camcorder in your right hand, bring the left hand to
+//           it: Miles plays the game's own reload ANIMATION (no Y press) and the mod swaps the cell in
+//           code when it ends. Y still reloads at any time (Test38's old hip-to-hand gesture is gone).
+// HOW-TO    (Test38) Labels and glows in the headset show what to do next. Each label stops after
+//           you have done that action 3 times ([Motion] Learned*); the glows stay.
+// MARKERS   Developer rings for every zone ([Motion] DevMarkers).
+// (Test40) DOORS are heavy hinged bodies ([DOORPHYS] below); CLIMBING with your hands ([CLIMB]):
+//           hold the edge, pull; hang, pull up or let go; ladders rung by rung. The hands that hold
+//           an edge, a handle or the panel they push stay there ([ANCHOR], OLInteract_HandAnchorWorld).
+// (Test43) [PHYSCLIMB] climbing is yours: your hands carry Miles's body 1:1. [DOOREVENT] a door the
+//           hands open fires the game's own door events (its scares). [BREATH] cover your mouth to
+//           hold his breath.
+//  [CLIMB] three ways to climb, picked in the launcher ([Motion] ClimbMode): A BUTTON
+//           (0, the default - the game's own climb, untouched), HYBRID (1 - your hands climb and the
+//           button still works) and PHYSICAL (2 - your hands only). PHYSICAL keeps the physical climb
+//           to platforms higher than Miles's head (a low one he jumps or vaults, the game's), takes A
+//           and the walk stick out of climbing (A only jumps at a ledge, the stick never climbs, the
+//           crouch button still drops you), has Miles grab the ledge with his LEFT hand by himself when
+//           he jumps at one - your left grip then takes that hand over (let go and he drops) - and gives
+//           him back to the game near the top, so its own climb animation ends the climb ([CLIMBFINISH]).
+//
+// Coordinates. The tracked hands and head arrive in the recenter frame (metres, +x right, +y up,
+// +z back). The camera hook records, per frame, the head-centre WORLD position and the body yaw
+// the view was built from; the same mapping the arm IK uses then carries a hand into the world
+// at 100 uu per metre (measured, see kMetersToUU in ol_ue3.cpp) and a world point back out.
+// Everything here runs on the game thread: the tick at the end of the frame's CPU split, the pad
+// merge from the XInput poll (also the game thread), so no state below needs a lock.
+// =============================================================================
+//
+// Contents - grep these tags to jump to a section:
+//   [CLIMB]           the three ways to climb
+//   [BATTERY]         the spare cell on the left hip
+//   [DOCUMENT]        the confidential document on the left shoulder
+//   [PHYSCLIMB]      (Test43) your hands carry Miles
+//   [PHYSICAL]        the game climbs, your hands ask for it
+//   [CLIMBPACE]      the climb's animation speed follows the pull of the holding hands
+//   [HANDNV]         (Test43) night vision on the camcorder in your hand
+//   [BREATH]         (Test43) cover your mouth
+//   [ROOMWALK]       (Test44) walk around your room and Miles walks with you
+//
+#include <Windows.h>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <cstdarg>
+#include "ol_xr.h"
+#include "ol_interact.h"
+#include "ol_menu.h"
+
+extern "C" void  OLProxyLog(const char* line);
+extern "C" int   OLUE3_FindProp(const char* cls, const char* prop, unsigned* off, unsigned* mask);
+extern "C" void* OLUE3_Hero();
+extern "C" void* OLUE3_PlayerController();
+extern "C" int   OLUE3_ObjectsOfClass(const char* cls, void** out, int max);
+extern "C" int   OLUE3_FrameView(float head[3], float* baseYaw);
+extern "C" int   OLUE3_DoorKnobWorld(void* door, float out[3]);
+extern "C" int   OLUE3_DoorHinge(void* door, float out[3]);
+extern "C" int   OLUE3_GameplayActive();
+extern "C" int   OLUE3_InGameMenu();
+extern "C" int   OLUE3_HolsterVisual(float out[3]);   // where the holstered model is drawn
+extern "C" int   OLUE3_BatteryVisual(float out[3]);   // [BATTERY] where the spare battery is drawn on the left hip
+extern "C" int   OLUE3_DocumentVisual(float out[3]);  // [DOCUMENT] where the confidential document is drawn on the left shoulder
+extern "C" int   OLUE3_DocumentHandVisual(float out[3]); // [DOCUMENT] where the held document is, for the "look at it" check
+extern "C" int   OLUE3_CamModelVisual(float out[3]);  // where the camcorder model is drawn in the hand
+extern "C" float OLUE3_BeginBatteryReload(int inactive); // [BATTERY] play OLHero's reload animation, return its length
+extern "C" void  OLUE3_DevBatteryTune(int which, float a, float b, float c);   // [BATTERY] live tuning
+extern "C" void  OLUE3_GetBatteryTune(float off[3], float rot[3]);
+extern "C" void  OLUE3_DevDocumentTune(int which, float a, float b, float c);  // [DOCUMENT] live tuning
+extern "C" float OLUE3_GetDocumentWristTwist();                                // [DOCUMENT] wrist-only forearm twist
+extern "C" void  OLUE3_SetDocumentWristTwist(float deg);
+extern "C" int   OLUE3_HeroMoveState(int* lm, int* sm);                 // (Test40) LocomotionMode, SpecialMove
+extern "C" int   OLUE3_DoorSetRatioAndTarget(void* door, float r);      // (Test40) 0xCC46A0
+extern "C" int   OLUE3_CameraBoneWorld(float out[3]);                   // (Test40) for the anchor check
+extern "C" void  OLUE3_SetHeroAnimRate(float r);                        // (Test41) [CLIMBPACE]
+extern "C" int   OLUE3_HeroMoveReady();                                 // (Test43) [PHYSCLIMB]
+extern "C" int   OLUE3_HeroMove(const float d[3], float out[3]);
+extern "C" int   OLUE3_HeroSetPhysics(int phys);
+extern "C" int   OLUE3_DoorEventHook(void* door);                        // (Test43) [DOOREVENT]
+extern "C" int   OLUE3_DoorTriggerEvent(void* door, int type);
+extern "C" void  OLUE3_DevCamHold(int mode);                             // (Test43) [CAMHOLD]
+extern "C" void  OLUE3_SetFlipScreenOn(int on);                          // (Test43) [FLIPSCREEN]
+extern "C" int   OLSound_Ready();                                        // (Test43) [BREATH] ol_sound.cpp
+extern "C" int   OLSound_BreathHeavy();
+extern "C" void  OLSound_Hush(int on);
+extern "C" void  OLSound_Gasp();
+extern "C" void  OLSound_Report();
+extern "C" void  OLSound_PostByName(const char* name, uint64_t obj);  // [DOOR] post a Wwise door sound by name
+extern "C" int   OLSound_PostFirstOf(const char* const* names, int n, uint64_t obj);   // [DOOR] first name this build has
+extern "C" void  OLSound_StopByName(const char* name, uint64_t obj);  // [DOOR] stop it early (the closing latch)
+extern "C" void  OLSound_SetRTPCByName(const char* name, float v);     // [DOOR] choose the slow/calm door sound
+extern "C" void  OLProxy_SetNvRequested(int on);                        // (Test43) [HANDNV] d3d9_proxy's night-vision state
+extern "C" void  OLProxy_SetHandleY(int on);                            // [RELOAD] the mod handles Y at the face
+extern "C" int   OLUE3_SceneScripted();                                  // (Test44) [ROOMWALK]
+extern "C" void  OLUE3_ObjScanStep();                                    // (Test45) [OBJSCAN]
+extern "C" void  OLUE3_SetCamAdjust(const float rot[3], const float off[3]);   // (Test45) [CAMADJUST]
+extern "C" void  OLUE3_SetLiveScreen(int on);                                       // (Test46) [LIVESCREEN]
+extern "C" int   OLUE3_GetHeadPos();
+
+static void ILog(const char* fmt, ...) {
+    char b[400]; va_list a; va_start(a, fmt); vsprintf_s(b, fmt, a); va_end(a); OLProxyLog(b);
+}
+
+// ---- settings ([Motion] in outlastvr.ini) ---------------------------------------------------------
+enum { ON_DOORS, ON_RAISE, ON_VIEWFINDER, ON_MARKERS, ON_PROMPTS, ON_HOLSTER, ON_HOWTO, ON_CLIMB,
+       ON_SCREEN, ON_BREATH, ON_ROOMWALK, ON_VFFRAME, ON_AUTOLEDGE, ON_COUNT };   //  ON_AUTOLEDGE   // (Test46) the framed zoom viewfinder   // (Test43) the camcorder's live screen, cover your mouth; (Test44) walk around for real
+// Defaults (Test39): reload is the Y button (always), the developer rings are off.
+// (Test40) climbing with your hands is on by default ([Motion] ClimbWithHands=0: A climbs, as before).
+// (Test45) the live screen (a compositor overlay, not the model's own screen) and cover-your-mouth are off.
+// (Test46) the live screen is ON again: it shows the camcorder lens's own picture now ([LIVESCREEN] ol_ue3 +
+// [LENSCAM] ol_xr), a second camera that runs only while the camcorder is in your hand facing you.
+// (Test46c) the user: "remove the live screen for now" - off by default and out of the menus again.
+//  guide markers/rings/glows and how-to/Quest hint labels are OFF by default (a clean view).
+//  ON_CLIMB (ClimbWithHands) follows ClimbMode: the launcher's default is A BUTTON, so no
+// hand climbing out of the box.
+static const int kOnDefault[ON_COUNT] = { 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1 };
+static volatile long g_on[ON_COUNT] = { 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1 };
+static const wchar_t* kKeys[ON_COUNT] = { L"DoorGrab", L"CamcorderRaiseGesture",
+                                          L"CamcorderViewfinder", L"DevMarkers", L"QuestPrompts",
+                                          L"CamcorderHolster", L"HowToHints", L"ClimbWithHands",
+                                          L"CamcorderLiveScreen", L"CoverMouth", L"RoomscaleWalk", L"ViewfinderFrame",
+                                          L"AutoLedgeGrab" };
+// ---- [CLIMB]  the three ways to climb ------------------------------------------------
+// Pure decisions only (no game state): tests/climb_modes_test.py compiles this block on its own.
+//   A BUTTON (0, the default): the game's own climb - A at a ledge, the walk stick on a ladder, its arms.
+//   HYBRID  (1): PHYSICAL in every respect - the same hands, the same A, the same stick rules, the same
+//     auto-catch and hand-off - EXCEPT that the left stick's FORWARD also moves him during a climb, so a
+//     player who still reaches for the stick is not stuck. 
+//   PHYSICAL (2): your hands only. A only jumps at a higher ledge (it never finishes a climb), the crouch
+//     button still drops you, and near the top the game takes Miles back and plays its own climb animation
+//     to the end. The walk stick never climbs a ladder for you, but it is not simply off: it walks you up to
+//     one (so the game mounts it), backs you down it, and at its top finishes the step off. Off a ladder the
+//     hands move him, so the stick does nothing while they carry him or while he hangs.
+// A saved 1 from the older builds (the guided climb, since removed) reads as HYBRID: the same hands, with
+// the button still there.
+enum { CLIMB_A_BUTTON = 0, CLIMB_HYBRID = 1, CLIMB_PHYSICAL = 2 };
+static int ClimbModeFromSaved(int saved) {
+    if (saved >= CLIMB_PHYSICAL) return CLIMB_PHYSICAL;
+    return saved == CLIMB_HYBRID ? CLIMB_HYBRID : CLIMB_A_BUTTON;
+}
+static bool ClimbHandsOn(int mode) { return mode != CLIMB_A_BUTTON; }
+// (phase 8) HYBRID behaves as PHYSICAL everywhere the mechanics decide anything. One predicate, so a
+// future rule cannot accidentally apply to one and not the other.
+static bool ClimbIsPhysicalLike(int mode) { return mode == CLIMB_PHYSICAL || mode == CLIMB_HYBRID; }
+// PHYSICAL/HYBRID: A is a jump at a ledge, never the end of a climb. A jump off a ladder is not a climb,
+// so that one stays the game's (crouch still drops him from a ledge too).
+static bool ClimbEatsJump(int mode, bool carrying, bool onLadder, bool holding, int lm) {
+    if (!ClimbIsPhysicalLike(mode)) return false;
+    if (carrying && onLadder) return false;
+    return carrying || holding || lm == 4;         // carried, holding an edge (Miles's own grab too), hanging
+}
+// PHYSICAL/HYBRID: what the left walk stick may do. It never climbs a ladder for him - the rungs do - but
+// it still walks him to the ladder (so the game mounts it and he is not "climbing it from far away"), it
+// backs him down one, and at the top it lets him finish the step off onto the floor.
+//   lm           LocomotionMode: 3 on a ladder, 4 hanging from a ledge, 5 shimmying along one
+//   ladderHold   a hand holds a rung while his feet are still on the floor
+//   edgeCarry    the hands carry him and it is not a ladder
+//   underTopUU   his feet under that ladder's top (huge when he is not on one)
+// (phase 8) HYBRID is the same rule; the ONLY difference is [HYBRIDSTICK] below, which re-allows forward.
+enum { CLIMB_STICK_FREE = 0, CLIMB_STICK_DOWN_ONLY = 1, CLIMB_STICK_LOCKED = 2 };
+static const float kPhysLadderTopFreeUU = 40.0f;   // at the top: the stick finishes the step off
+static int ClimbStickRule(int mode, int lm, bool ladderHold, bool edgeCarry, float underTopUU) {
+    if (!ClimbIsPhysicalLike(mode)) return CLIMB_STICK_FREE;      // A button: the game's own stick
+    if (lm == 3) return underTopUU <= kPhysLadderTopFreeUU ? CLIMB_STICK_FREE : CLIMB_STICK_DOWN_ONLY;
+    if (ladderHold) return CLIMB_STICK_FREE;                      // a hand on a rung, feet on the floor
+    // [LEDGEWALK] HANGING FROM A LEDGE: THE STICK IS THE GAME'S.
+    // Walking sideways along a ledge is the GAME's own move (LocomotionMode 4/5, its own shimmy animation).
+    // The mod used to keep the stick off here because "the hands move him"; that turned a built-in game
+    // move into a fight and the ledge could not be walked at all. The stick now goes through untouched in
+    // EVERY climb mode, so the standard animation plays - the default the player asked for.
+    if (edgeCarry) return CLIMB_STICK_LOCKED;                     // a hand-carried climb: still no stick
+    return CLIMB_STICK_FREE;                                      // walking, jumping, hanging, the mantle...
+}
+// (phase 8) HYBRID: the walk stick's FORWARD still moves him while the hands carry him - the single
+// documented difference from PHYSICAL. Every other lock stands, so a player cannot walk off a ladder or
+// out of a hang by leaning on the stick.
+static int ClimbStickRuleHybrid(int mode, int lm, bool ladderHold, bool edgeCarry, float underTopUU,
+                                bool forwardHeld) {
+    if (mode == CLIMB_HYBRID && forwardHeld) return CLIMB_STICK_FREE;
+    return ClimbStickRule(mode, lm, ladderHold, edgeCarry, underTopUU);
+}
+// A platform Miles has to climb: its lip is over his head (aboveEyesUU over his eyes). A lower one he can
+// jump or vault over, and the game keeps that to the button.
+static bool EdgeNeedsClimb(float lipZ, float eyeZ, float aboveEyesUU) { return lipZ >= eyeZ + aboveEyesUU; }
+// Near the top the hands hand Miles back to the game: his eyes this close under the lip (or over it).
+// 0 or less turns the hand-off off and the hands finish the climb themselves.
+static bool ClimbHandsOff(float eyeZ, float lipZ, float belowLipUU) {
+    return belowLipUU > 0.0f && eyeZ >= lipZ - belowLipUU;
+}
+//  Which holding hands play the game's own arm animation instead of the tracked hand.
+// A guided climb always does. In PHYSICAL, Miles's automatic left-hand grab and every hold while his hands
+// carry him do too - the holding hand stays in the game's position while the controller's pull moves his
+// body. A released hand is never left in the game's pose.
+static bool ClimbHoldPlaysGameArm(int guidedHold, bool physicalHold) {
+    return guidedHold != 0 || physicalHold;
+}
+//  PHYSICAL hand strokes: how far a hand has moved down (+) or up (-) since it took its grip (m).
+// A stroke fires once per movement (+1 pulled down, -1 pushed up) and re-arms when the hand is back near the
+// height where it took the grip, so each pull is one climb and not a continuous drive.
+static const float kStrokeM = 0.12f, kStrokeRearmM = 0.04f;
+static int HandStroke(float downM, bool* pullArmed, bool* pushArmed) {
+    if (*pullArmed && downM > kStrokeM) { *pullArmed = false; return 1; }
+    if (*pushArmed && downM < -kStrokeM) { *pushArmed = false; return -1; }
+    if (fabsf(downM) < kStrokeRearmM) { *pullArmed = true; *pushArmed = true; }
+    return 0;
+}
+// (Test43) [Motion] ClimbMode: 2 = physical (your hands carry Miles), 1 = hybrid (hands and the button),
+// 0 = the A button (the default since 1.2.0). ON_CLIMB (ClimbWithHands) is derived from it, so a
+// ClimbMode that is there always wins; an older ini with only ClimbWithHands reads as the A button now.
+// [Motion] PhysClimbEdgeAboveEyes / PhysClimbHandOffUU tune the two rules above (uu, 1 uu = 1 cm).
+// [Motion] CamcorderHold: 4 = free hold (default), 3 = the game's raise pose (Test42).
+static volatile long g_climbMode = CLIMB_A_BUTTON;
+static volatile long g_physEdgeAboveEyes = 10;
+static volatile long g_physHandsOffUU = 20;
+static volatile long g_camHold = 4;    //  back to 4: the real-camcorder hold (5) was broken
+static volatile long g_camHud = 1;        // [CAMHUD] [Render] CamcorderHud
+// (Test48) [RUNGRIP] the left grip is also sprint. Pushing the left stick, with the left hand down at the hip or
+// waist (0.45 m or more below the head), a fresh squeeze is a sprint, not a hold on the table, counter or railing
+// edge beside you - a hold stops sprint and hands Miles to your hands ("most of the time running ... does not
+// work"). A raised hand still takes an edge, and a ladder rung is always taken. [Motion] RunGripIgnoresLowEdges=0
+// = as before.
+static volatile long g_runGripLow = 1;
+// (Test49) [CAMBUTTON] [Motion] CamcorderControl: 0 = hands-on (default: take it from the right hip, bring it to
+// your eye), 1 = GRIP BUTTON - one squeeze of the right grip raises the camcorder, the next lowers it (the game's
+// own toggle), and you look through it with your head, so the hand can rest anywhere: for seated players and
+// arms that tire of being held up. The hip, the raise-to-eye gesture and right-hand door and edge grabs are off
+// then - the right grip is only the camcorder button. The hands-on settings are left as they are, so switching
+// back restores them.
+static volatile long g_camButton = 0;
+extern "C" int  OLInteract_CamButton() { return g_camButton ? 1 : 0; }
+extern "C" void OLInteract_SetCamButton(int on) {
+    g_camButton = on ? 1 : 0;
+    ILog("[OLVR][CAMBUTTON] camcorder controls: %s", g_camButton ? "GRIP BUTTON (squeeze to raise, again to lower)" : "hands-on");
+}
+// (Test45) [CAMADJUST] the camcorder in your hand: tilt, turn, roll (deg); forward, up, right (cm)
+static float g_camAdjRot[3] = { 0.0f, 0.0f, 0.0f }, g_camAdjOff[3] = { 0.0f, 0.0f, 0.0f };
+static const wchar_t* kCamAdjKeys[6] = { L"CamcorderTilt", L"CamcorderTurn", L"CamcorderRoll", L"CamcorderForwardCM", L"CamcorderUpCM", L"CamcorderRightCM" };
+//  [DOOR] the live-tuned hand placement: the trim of the hand ON the knob (up, forward,
+// right in uu), and the two collision numbers the same menu row exposes.
+//  live-tunable hand placement / collision, kept as plain floats here because V3 is
+// declared further down the file and OLInteract_Save (above) needs these.
+static float g_pushDepthUU = 11.0f;                    // wrist kept this far off the panel (uu)
+//  the contact radius, as a NAMED tunable so the "rings too late" report has one number:
+// this is how near the wrist has to be to the panel for the collision AND the push to engage. The
+// shipped 7 uu was smaller than a palm is thick, so a hand was through before it registered.
+static float g_contactUU = 14.0f;                      // was the fixed 7 (kContactUU)
+static const float kPushDepthUUShipped = 11.0f;
+static const float kContactUUShipped = 14.0f;
+extern "C" void OLInteract_GetCamAdjust(float rot[3], float off[3]) { for (int i = 0; i < 3; ++i) { rot[i] = g_camAdjRot[i]; off[i] = g_camAdjOff[i]; } }
+extern "C" void OLInteract_SetCamAdjust(const float rot[3], const float off[3]) {
+    for (int i = 0; i < 3; ++i) {
+        g_camAdjRot[i] = rot[i] < -180.0f ? -180.0f : (rot[i] > 180.0f ? 180.0f : rot[i]);
+        g_camAdjOff[i] = off[i] < -30.0f ? -30.0f : (off[i] > 30.0f ? 30.0f : off[i]);
+    }
+    OLUE3_SetCamAdjust(g_camAdjRot, g_camAdjOff);
+}
+// [BATTERY]  the spare cell's in-hand placement, tuned live from the menu.
+static const float kBatDefaultOff[3] = { 9.0f, -1.0f, -1.0f };  // forward, right, up (uu)
+static const float kBatDefaultRot[3] = { 90.0f, -33.0f, 0.0f }; // roll, pitch, yaw (deg)
+static float g_batAdjOff[3] = { 9.0f, -1.0f, -1.0f };
+static float g_batAdjRot[3] = { 90.0f, -33.0f, 0.0f };
+static const wchar_t* kBatAdjKeys[6] = { L"BatteryForward", L"BatteryRight", L"BatteryUp", L"BatteryRoll", L"BatteryPitch", L"BatteryYaw" };
+extern "C" void OLInteract_GetBatteryAdjust(float off[3], float rot[3]) {
+    for (int i = 0; i < 3; ++i) { off[i] = g_batAdjOff[i]; rot[i] = g_batAdjRot[i]; }
+}
+extern "C" void OLInteract_SetBatteryAdjust(const float off[3], const float rot[3]) {
+    for (int i = 0; i < 3; ++i) {
+        g_batAdjOff[i] = off[i] < -30.0f ? -30.0f : (off[i] > 30.0f ? 30.0f : off[i]);
+        g_batAdjRot[i] = rot[i] < -180.0f ? -180.0f : (rot[i] > 180.0f ? 180.0f : rot[i]);
+    }
+    OLUE3_DevBatteryTune(2, g_batAdjOff[0], g_batAdjOff[1], g_batAdjOff[2]);
+    OLUE3_DevBatteryTune(3, g_batAdjRot[0], g_batAdjRot[1], g_batAdjRot[2]);
+}
+extern "C" void OLInteract_ResetBatteryAdjust() {
+    OLInteract_SetBatteryAdjust(kBatDefaultOff, kBatDefaultRot);
+}
+// [DOCUMENT]  the confidential document's in-hand placement, tuned live from the menu.
+static const float kDocDefaultOff[3] = { 18.0f, -5.0f, 2.0f };  // forward, right, up (uu)
+static const float kDocDefaultRot[3] = { 122.0f, -28.0f, -32.0f }; // roll, pitch, yaw (deg)
+static float g_docAdjOff[3] = { 18.0f, -5.0f, 2.0f };
+static float g_docAdjRot[3] = { 122.0f, -28.0f, -32.0f };
+static const wchar_t* kDocAdjKeys[6] = { L"DocumentForward", L"DocumentRight", L"DocumentUp", L"DocumentRoll", L"DocumentPitch", L"DocumentYaw" };
+extern "C" void OLInteract_GetDocumentAdjust(float off[3], float rot[3]) {
+    for (int i = 0; i < 3; ++i) { off[i] = g_docAdjOff[i]; rot[i] = g_docAdjRot[i]; }
+}
+extern "C" void OLInteract_SetDocumentAdjust(const float off[3], const float rot[3]) {
+    for (int i = 0; i < 3; ++i) {
+        g_docAdjOff[i] = off[i] < -30.0f ? -30.0f : (off[i] > 30.0f ? 30.0f : off[i]);
+        g_docAdjRot[i] = rot[i] < -180.0f ? -180.0f : (rot[i] > 180.0f ? 180.0f : rot[i]);
+    }
+    OLUE3_DevDocumentTune(2, g_docAdjOff[0], g_docAdjOff[1], g_docAdjOff[2]);
+    OLUE3_DevDocumentTune(3, g_docAdjRot[0], g_docAdjRot[1], g_docAdjRot[2]);
+}
+extern "C" void OLInteract_ResetDocumentAdjust() {
+    OLInteract_SetDocumentAdjust(kDocDefaultOff, kDocDefaultRot);
+}
+// [DOCUMENT] (V1) the left wrist's lift while it holds the document (deg): the wrist bends upward
+// around the wrist joint, lifting the hand and the paper together out of the flat neutral grip.
+static const float kDocDefaultWristTwist = -45.0f;
+extern "C" float OLInteract_GetDocumentWrist() { return OLUE3_GetDocumentWristTwist(); }
+extern "C" void  OLInteract_SetDocumentWrist(float deg) { OLUE3_SetDocumentWristTwist(deg); }
+extern "C" void  OLInteract_ResetDocumentWrist() { OLUE3_SetDocumentWristTwist(kDocDefaultWristTwist); }
+// [DOCWRIST]  The wrist can also be dialled live, axis by axis: three degrees-angles
+// applied at the wrist joint about the actor's own X (forward), Y (right) and Z (up). Set any of them
+// and the automatic lift above stands down, so what you dial is exactly what you get - this is how the
+// grip gets tuned in the headset instead of by guesswork.
+// Tuned in the headset (x 30, y 35, z 15): what the grip wants is now the default.
+static float g_docWristRot[3] = { 30.0f, 35.0f, 15.0f };
+extern "C" void OLInteract_GetDocumentWristRot(float out[3]) {
+    out[0] = g_docWristRot[0]; out[1] = g_docWristRot[1]; out[2] = g_docWristRot[2];
+}
+extern "C" void OLInteract_SetDocumentWristRot(const float in[3]) {
+    for (int i = 0; i < 3; ++i) {
+        float v = in ? in[i] : 0.0f;
+        if (v < -180.0f) v = -180.0f;
+        if (v > 180.0f) v = 180.0f;
+        g_docWristRot[i] = v;
+    }
+}
+extern "C" void OLInteract_ResetDocumentWristRot() {
+    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+    OLInteract_SetDocumentWristRot(zero);
+}
+// The line to send back: everything that positions the paper's wrist, in one place.
+extern "C" void OLInteract_LogDocumentWrist() {
+    ILog("[OLVR][DOCWRIST] wrist: lift %.0f | x %.0f y %.0f z %.0f (deg, about the actor's X fwd / Y right / Z up) | grip fwd %.0f right %.0f up %.0f | roll %.0f pitch %.0f yaw %.0f",
+         OLInteract_GetDocumentWrist(), g_docWristRot[0], g_docWristRot[1], g_docWristRot[2],
+         g_docAdjOff[0], g_docAdjOff[1], g_docAdjOff[2], g_docAdjRot[0], g_docAdjRot[1], g_docAdjRot[2]);
+}
+// How close (m) the right controller has to come to the eye zone to raise the camcorder. The grip
+// pose sits in the handle, so a controller held against the headset is ~5 cm from the zone and one
+// held a hand's width out ~12 cm.
+static float g_eyeReach = 0.14f;
+// [HOWTO] how often each action has been done; its label stops at kLearnDone
+enum { LN_TAKECAM, LN_RAISE, LN_EJECT, LN_INSERT, LN_DOOR, LN_CLIMB, LN_BREATH, LN_RECENTER, LN_COUNT };
+static const wchar_t* kLearnKeys[LN_COUNT] = { L"LearnedTakeCamcorder", L"LearnedRaise", L"LearnedEject",
+                                               L"LearnedInsert", L"LearnedDoor", L"LearnedClimb", L"LearnedCoverMouth",
+                                               L"LearnedRecenter" };
+static const int kLearnDone = 3;
+static int g_learn[LN_COUNT] = {};
+extern "C" int  OLInteract_Get(int w) { return (w >= 0 && w < ON_COUNT && g_on[w]) ? 1 : 0; }
+extern "C" void OLInteract_Set(int w, int on) {
+    if (w >= 0 && w < ON_COUNT) g_on[w] = on ? 1 : 0;
+    if (w == ON_SCREEN) OLUE3_SetFlipScreenOn(on);
+}
+//  0 = the A button (default), 1 = hybrid, 2 = physical
+extern "C" int OLInteract_ClimbMode() { return g_on[ON_CLIMB] ? (int)g_climbMode : CLIMB_A_BUTTON; }
+extern "C" void OLInteract_SetClimbMode(int m) {
+    const int mode = ClimbModeFromSaved(m);
+    g_climbMode = mode;
+    g_on[ON_CLIMB] = ClimbHandsOn(mode) ? 1 : 0;
+}
+extern "C" int OLInteract_CamHold() { return (int)g_camHold; }
+extern "C" void OLInteract_SetCamHold(int m) { g_camHold = m == 3 ? 3 : 4; OLUE3_DevCamHold((int)g_camHold); }
+static bool IniPath(wchar_t* out, size_t n) {
+    wchar_t exe[MAX_PATH] = { 0 };
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
+    wchar_t* slash = wcsrchr(exe, L'\\');
+    if (!slash) return false;
+    *(slash + 1) = 0;
+    swprintf_s(out, n, L"%soutlastvr.ini", exe);
+    return true;
+}
+void OLInteract_Init() {
+    wchar_t ini[MAX_PATH];
+    if (!IniPath(ini, MAX_PATH)) return;
+    for (int i = 0; i < ON_COUNT; ++i) g_on[i] = GetPrivateProfileIntW(L"Motion", kKeys[i], kOnDefault[i], ini) ? 1 : 0;
+    g_on[ON_HOWTO] = 0;   // the how-to labels are removed
+    for (int i = 0; i < LN_COUNT; ++i) g_learn[i] = GetPrivateProfileIntW(L"Motion", kLearnKeys[i], 0, ini);
+    wchar_t v[32];
+    GetPrivateProfileStringW(L"Motion", L"RaiseToEyeReachM", L"0.14", v, 32, ini);
+    g_eyeReach = (float)_wtof(v);
+    if (!(g_eyeReach >= 0.05f && g_eyeReach <= 0.25f)) g_eyeReach = 0.14f;
+    // ClimbMode decides (the launcher writes it, and its default is the A button). An older ini only has
+    // ClimbWithHands, and no ClimbMode at all means the same A button.
+    const int cm = GetPrivateProfileIntW(L"Motion", L"ClimbMode", CLIMB_A_BUTTON, ini);
+    const int cmode = ClimbModeFromSaved(cm);
+    g_climbMode = cmode;
+    g_on[ON_CLIMB] = ClimbHandsOn(cmode) ? 1 : 0;
+    g_physEdgeAboveEyes = GetPrivateProfileIntW(L"Motion", L"PhysClimbEdgeAboveEyes", 10, ini);   // 
+    if (g_physEdgeAboveEyes < 0) g_physEdgeAboveEyes = 0; if (g_physEdgeAboveEyes > 120) g_physEdgeAboveEyes = 120;
+    g_physHandsOffUU = GetPrivateProfileIntW(L"Motion", L"PhysClimbHandOffUU", 20, ini);          //  0: never
+    if (g_physHandsOffUU < 0) g_physHandsOffUU = 0; if (g_physHandsOffUU > 200) g_physHandsOffUU = 200;
+    ILog("[OLVR][CLIMB] climbing: %s (ClimbMode=%d, a physical climb edge must be %ld uu over his eyes, the game"
+         " finishes the climb %ld uu under the lip%s)",
+         cmode == CLIMB_PHYSICAL ? "PHYSICAL (your hands only)" : (cmode == CLIMB_HYBRID ? "HYBRID (hands and the button)" : "A BUTTON (the game's climb)"),
+         cmode, g_physEdgeAboveEyes, g_physHandsOffUU, g_physHandsOffUU <= 0 ? " - never, the hands finish it" : "");
+    g_camHold = GetPrivateProfileIntW(L"Motion", L"CamcorderHold", 4, ini) == 3 ? 3 : 4;   //  a saved 5 means 4
+    OLInteract_SetCamcorderHud(GetPrivateProfileIntW(L"Render", L"CamcorderHud", 1, ini));
+    g_runGripLow = GetPrivateProfileIntW(L"Motion", L"RunGripIgnoresLowEdges", 1, ini) ? 1 : 0;   // (Test48)
+    OLInteract_SetCamButton(GetPrivateProfileIntW(L"Motion", L"CamcorderControl", 0, ini));        // (Test49)
+    ILog("[OLVR][RUNGRIP] a running squeeze at the hip is sprint, not an edge: %s", g_runGripLow ? "on" : "off");
+    OLUE3_DevCamHold((int)g_camHold);
+    {   //  [DOOR] the hand/panel collision, tuned live.
+        GetPrivateProfileStringW(L"Motion", L"HandOnKnobDepthUU", L"11", v, 32, ini); const float depth = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", L"HandCollisionRangeUU", L"14", v, 32, ini); const float reach = (float)_wtof(v);
+        OLInteract_SetHandPlacement(depth, reach);
+        ILog("[OLVR][DOORPLACE] wrist off the panel %.0f uu, hand collision range %.0f uu", depth, reach);
+    }
+    {   // (Test45) [CAMADJUST]
+        float r[3], o[3];
+        for (int i = 0; i < 6; ++i) { GetPrivateProfileStringW(L"Motion", kCamAdjKeys[i], L"0", v, 32, ini); (i < 3 ? r[i] : o[i - 3]) = (float)_wtof(v); }
+        OLInteract_SetCamAdjust(r, o);
+    }
+    {   // [BATTERY] the spare cell's in-hand placement
+        float off[3], rot[3];
+        GetPrivateProfileStringW(L"Motion", kBatAdjKeys[0], L"9", v, 32, ini); off[0] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kBatAdjKeys[1], L"-1", v, 32, ini); off[1] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kBatAdjKeys[2], L"-1", v, 32, ini); off[2] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kBatAdjKeys[3], L"90", v, 32, ini); rot[0] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kBatAdjKeys[4], L"-33", v, 32, ini); rot[1] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kBatAdjKeys[5], L"0", v, 32, ini); rot[2] = (float)_wtof(v);
+        OLInteract_SetBatteryAdjust(off, rot);
+    }
+    {   // [DOCUMENT] the confidential document's in-hand placement
+        float off[3], rot[3];
+        GetPrivateProfileStringW(L"Motion", kDocAdjKeys[0], L"18", v, 32, ini); off[0] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kDocAdjKeys[1], L"-5", v, 32, ini); off[1] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kDocAdjKeys[2], L"2", v, 32, ini); off[2] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kDocAdjKeys[3], L"122", v, 32, ini); rot[0] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kDocAdjKeys[4], L"-28", v, 32, ini); rot[1] = (float)_wtof(v);
+        GetPrivateProfileStringW(L"Motion", kDocAdjKeys[5], L"-32", v, 32, ini); rot[2] = (float)_wtof(v);
+        OLInteract_SetDocumentAdjust(off, rot);
+        float wr = -45.0f;
+        GetPrivateProfileStringW(L"Motion", L"DocumentWristLift", L"-45", v, 32, ini); wr = (float)_wtof(v);
+        OLInteract_SetDocumentWrist(wr);
+        {   // [DOCWRIST] the live-tuned wrist angles
+            float rot[3] = { 0.0f, 0.0f, 0.0f };
+            GetPrivateProfileStringW(L"Motion", L"DocumentWristX", L"30", v, 32, ini); rot[0] = (float)_wtof(v);
+            GetPrivateProfileStringW(L"Motion", L"DocumentWristY", L"35", v, 32, ini); rot[1] = (float)_wtof(v);
+            GetPrivateProfileStringW(L"Motion", L"DocumentWristZ", L"15", v, 32, ini); rot[2] = (float)_wtof(v);
+            OLInteract_SetDocumentWristRot(rot);
+        }
+    }
+    OLUE3_SetFlipScreenOn(g_on[ON_SCREEN]);
+    ILog("[OLVR][INTERACT] doors=%ld holster=%ld raiseToEye=%ld (reach %.2f m) viewfinder=%ld howTo=%ld "
+         "devMarkers=%ld questPrompts=%ld climbWithHands=%ld climbMode=%ld camHold=%ld liveScreen=%ld coverMouth=%ld roomscaleWalk=%ld | learned take=%d raise=%d eject=%d insert=%d door=%d climb=%d breath=%d",
+         g_on[ON_DOORS], g_on[ON_HOLSTER], g_on[ON_RAISE], g_eyeReach, g_on[ON_VIEWFINDER],
+         g_on[ON_HOWTO], g_on[ON_MARKERS], g_on[ON_PROMPTS], g_on[ON_CLIMB], g_climbMode, g_camHold, g_on[ON_SCREEN], g_on[ON_BREATH], g_on[ON_ROOMWALK],
+         g_learn[0], g_learn[1], g_learn[2], g_learn[3], g_learn[4], g_learn[5], g_learn[6]);
+}
+void OLInteract_Save(const wchar_t* ini) {
+    for (int i = 0; i < ON_COUNT; ++i) WritePrivateProfileStringW(L"Motion", kKeys[i], g_on[i] ? L"1" : L"0", ini);
+    wchar_t b[32]; swprintf_s(b, L"%.3f", g_eyeReach); WritePrivateProfileStringW(L"Motion", L"RaiseToEyeReachM", b, ini);
+    swprintf_s(b, L"%ld", g_climbMode < 0 ? 0L : (long)g_climbMode); WritePrivateProfileStringW(L"Motion", L"ClimbMode", b, ini);
+    swprintf_s(b, L"%ld", g_camHold); WritePrivateProfileStringW(L"Motion", L"CamcorderHold", b, ini);
+    { wchar_t hb[8]; swprintf_s(hb, L"%ld", g_camHud); WritePrivateProfileStringW(L"Render", L"CamcorderHud", hb, ini); }   // 
+    WritePrivateProfileStringW(L"Motion", L"CamcorderControl", g_camButton ? L"1" : L"0", ini);   // (Test49)
+    for (int i = 0; i < 6; ++i) { swprintf_s(b, L"%.0f", i < 3 ? g_camAdjRot[i] : g_camAdjOff[i - 3]); WritePrivateProfileStringW(L"Motion", kCamAdjKeys[i], b, ini); }
+    for (int i = 0; i < 6; ++i) { swprintf_s(b, L"%.0f", i < 3 ? g_batAdjOff[i] : g_batAdjRot[i - 3]); WritePrivateProfileStringW(L"Motion", kBatAdjKeys[i], b, ini); }
+    for (int i = 0; i < 6; ++i) { swprintf_s(b, L"%.0f", i < 3 ? g_docAdjOff[i] : g_docAdjRot[i - 3]); WritePrivateProfileStringW(L"Motion", kDocAdjKeys[i], b, ini); }
+    { swprintf_s(b, L"%.0f", OLInteract_GetDocumentWrist()); WritePrivateProfileStringW(L"Motion", L"DocumentWristLift", b, ini); }
+    {   // [DOCWRIST] the live-tuned wrist angles
+        float rot[3]; OLInteract_GetDocumentWristRot(rot);
+        swprintf_s(b, L"%.0f", rot[0]); WritePrivateProfileStringW(L"Motion", L"DocumentWristX", b, ini);
+        swprintf_s(b, L"%.0f", rot[1]); WritePrivateProfileStringW(L"Motion", L"DocumentWristY", b, ini);
+        swprintf_s(b, L"%.0f", rot[2]); WritePrivateProfileStringW(L"Motion", L"DocumentWristZ", b, ini);
+    }
+    for (int i = 0; i < LN_COUNT; ++i) { swprintf_s(b, L"%d", g_learn[i]); WritePrivateProfileStringW(L"Motion", kLearnKeys[i], b, ini); }
+    {   //  [DOOR] hand placement / collision, so a live tune survives the session
+        swprintf_s(b, L"%.0f", g_pushDepthUU); WritePrivateProfileStringW(L"Motion", L"HandOnKnobDepthUU", b, ini);
+        swprintf_s(b, L"%.0f", g_contactUU); WritePrivateProfileStringW(L"Motion", L"HandCollisionRangeUU", b, ini);
+    }
+}
+static void Learn(int what) {
+    if (what < 0 || what >= LN_COUNT || g_learn[what] >= kLearnDone) return;
+    ++g_learn[what];
+    wchar_t ini[MAX_PATH], b[16];
+    if (IniPath(ini, MAX_PATH)) { swprintf_s(b, L"%d", g_learn[what]); WritePrivateProfileStringW(L"Motion", kLearnKeys[what], b, ini); }
+    if (g_learn[what] == kLearnDone) ILog("[OLVR][HOWTO] '%ls' learned - its label is hidden from now on", kLearnKeys[what]);
+}
+// How-to labels were removed: nothing is taught, so no label is ever drawn.
+static bool Teach(int what) { (void)what; return false; }
+
+// ---- small maths ---------------------------------------------------------------------------------
+struct V3 { float x, y, z; };
+static V3 Sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 Add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 Mul(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+static float Len(V3 a) { return sqrtf(a.x * a.x + a.y * a.y + a.z * a.z); }
+static V3 QRot(const OLXrPose& q, V3 v) {
+    const V3 u = { q.qx, q.qy, q.qz };
+    const V3 c1 = { u.y * v.z - u.z * v.y + q.qw * v.x, u.z * v.x - u.x * v.z + q.qw * v.y, u.x * v.y - u.y * v.x + q.qw * v.z };
+    const V3 c2 = { u.y * c1.z - u.z * c1.y, u.z * c1.x - u.x * c1.z, u.x * c1.y - u.y * c1.x };
+    return { v.x + 2.0f * c2.x, v.y + 2.0f * c2.y, v.z + 2.0f * c2.z };
+}
+static float Wrap180(float d) { while (d > 180.0f) d -= 360.0f; while (d < -180.0f) d += 360.0f; return d; }
+static V3 P3(const OLXrPose& p) { return { p.px, p.py, p.pz }; }
+
+// The frame's mapping between the recenter frame and the world.
+static V3 s_headT, s_headW;       // tracked head (m) and its world position (uu)
+static float s_cy = 1.0f, s_sy = 0.0f;
+static V3 TrackToWorld(V3 t) {
+    const V3 d = Sub(t, s_headT);
+    const float f = -d.z * 100.0f, r = d.x * 100.0f, u = d.y * 100.0f;
+    return { s_headW.x + s_cy * f - s_sy * r, s_headW.y + s_sy * f + s_cy * r, s_headW.z + u };
+}
+static V3 WorldToTrack(V3 w) {
+    const V3 d = Mul(Sub(w, s_headW), 0.01f);
+    const float f = d.x * s_cy + d.y * s_sy, r = -d.x * s_sy + d.y * s_cy;
+    return { s_headT.x + r, s_headT.y + d.z, s_headT.z - f };
+}
+
+// ---- engine fields, by reflection -----------------------------------------------------------------
+static struct {
+    bool ok; ULONGLONG nextTry; int tries;
+    unsigned camState, zoom, energy, numBat, loc;
+    unsigned openR, tgtR, maxAng, dtype, bits, mLocked, mFake, mRev, mCant;
+    // (Test40) optional: the door's own state, and the ledge markers
+    unsigned dstate, dbreak, duser, mBusyBits;
+    unsigned lmNext, lmBits, mClimbUp, mHang, gmBits, mEnabled;
+    unsigned ladOther, rot;                                  // (Test41) ladders
+    unsigned phys, vel, cyl, cylH, cylR;                     // (Test43) [PHYSCLIMB] Physics, Velocity, the collision cylinder
+    unsigned camMode;                                        // (Test43) [HANDNV] OLHero.CamcorderMode (0 default, 1/2 night vision)
+} F = {};
+static bool Resolve() {
+    if (F.ok) return true;
+    const ULONGLONG now = GetTickCount64();
+    if (now < F.nextTry || F.tries >= 20) return false;
+    F.nextTry = now + 3000; ++F.tries;
+    bool ok = OLUE3_FindProp("OLHero", "CamcorderState", &F.camState, nullptr) &&
+              OLUE3_FindProp("OLHero", "CurrentCamcorderZoomFactor", &F.zoom, nullptr) &&
+              OLUE3_FindProp("OLHero", "CurrentBatterySetEnergy", &F.energy, nullptr) &&
+              OLUE3_FindProp("OLPlayerController", "NumBatteries", &F.numBat, nullptr) &&
+              OLUE3_FindProp("Actor", "Location", &F.loc, nullptr) &&
+              OLUE3_FindProp("OLDoor", "OpenRatio", &F.openR, nullptr) &&
+              OLUE3_FindProp("OLDoor", "TargetOpenRatio", &F.tgtR, nullptr) &&
+              OLUE3_FindProp("OLDoor", "MaxOpenAngle", &F.maxAng, nullptr) &&
+              OLUE3_FindProp("OLDoor", "DoorType", &F.dtype, nullptr) &&
+              OLUE3_FindProp("OLDoor", "bLocked", &F.bits, &F.mLocked);
+    unsigned b2 = 0;
+    if (ok) {
+        OLUE3_FindProp("OLDoor", "bFakeUnlocked", &b2, &F.mFake);
+        OLUE3_FindProp("OLDoor", "bReverseDirection", &b2, &F.mRev);
+        OLUE3_FindProp("OLDoor", "bCantClose", &b2, &F.mCant);
+        // (Test40) [DOORPHYS] when the game is doing something with a door itself
+        OLUE3_FindProp("OLDoor", "DoorState", &F.dstate, nullptr);
+        OLUE3_FindProp("OLDoor", "DoorBreakState", &F.dbreak, nullptr);
+        OLUE3_FindProp("OLDoor", "DoorUser", &F.duser, nullptr);
+        const char* busy[] = { "bPlayingLockedAnim", "bPlayingBlockedAnim", "bPlayingAutoCloseAnim", "bAITraversing" };
+        for (const char* nm : busy) { unsigned m = 0; if (OLUE3_FindProp("OLDoor", nm, &b2, &m)) F.mBusyBits |= m; }
+        // (Test40) [CLIMB] the edges you can climb
+        if (OLUE3_FindProp("OLLedgeMarker", "Next", &F.lmNext, nullptr)) {
+            OLUE3_FindProp("OLLedgeMarker", "bCanClimbUp", &F.lmBits, &F.mClimbUp);
+            OLUE3_FindProp("OLLedgeMarker", "bCanLedgeHang", &b2, &F.mHang);
+            OLUE3_FindProp("OLGameplayMarker", "bEnabled", &F.gmBits, &F.mEnabled);
+        }
+        // (Test41) [LADDERGRAB] ladders: a bottom and a top OLLadderMarker pointing at each other
+        OLUE3_FindProp("OLLadderMarker", "OtherMarker", &F.ladOther, nullptr);
+        OLUE3_FindProp("Actor", "Rotation", &F.rot, nullptr);
+        // (Test43) [PHYSCLIMB] Miles's physics mode and velocity, and his collision cylinder's size
+        OLUE3_FindProp("Actor", "Physics", &F.phys, nullptr);
+        OLUE3_FindProp("Actor", "Velocity", &F.vel, nullptr);
+        OLUE3_FindProp("Pawn", "CylinderComponent", &F.cyl, nullptr);
+        OLUE3_FindProp("CylinderComponent", "CollisionHeight", &F.cylH, nullptr);
+        OLUE3_FindProp("CylinderComponent", "CollisionRadius", &F.cylR, nullptr);
+        OLUE3_FindProp("OLHero", "CamcorderMode", &F.camMode, nullptr);
+        ILog("[OLVR][PHYSCLIMB] Physics+0x%X Velocity+0x%X CylinderComponent+0x%X (height+0x%X radius+0x%X)", F.phys, F.vel, F.cyl, F.cylH, F.cylR);
+        ILog("[OLVR][INTERACT] (Test40) door state+0x%X break+0x%X user+0x%X busyBits=0x%X | ledge next+0x%X bits+0x%X climbUp=0x%X hang=0x%X enabled+0x%X/0x%X",
+             F.dstate, F.dbreak, F.duser, F.mBusyBits, F.lmNext, F.lmBits, F.mClimbUp, F.mHang, F.gmBits, F.mEnabled);
+    }
+    F.ok = ok;
+    ILog("[OLVR][INTERACT] fields %s (try %d): camState+0x%X zoom+0x%X energy+0x%X numBat+0x%X | door open+0x%X target+0x%X "
+         "max+0x%X type+0x%X bits+0x%X locked=0x%X fake=0x%X reverse=0x%X cantClose=0x%X",
+         ok ? "resolved" : "MISSING", F.tries, F.camState, F.zoom, F.energy, F.numBat, F.openR, F.tgtR,
+         F.maxAng, F.dtype, F.bits, F.mLocked, F.mFake, F.mRev, F.mCant);
+    return ok;
+}
+template <class T> static bool Rd(const void* base, unsigned off, T* out) {
+    if (!base || !off) return false;
+    __try { *out = *(const T*)((const char*)base + off); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool WrF(void* base, unsigned off, float v) {
+    if (!base || !off) return false;
+    __try { *(volatile float*)((char*)base + off) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool WrI(void* base, unsigned off, int v) {
+    if (!base || !off) return false;
+    __try { *(volatile int*)((char*)base + off) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// ---- shared per-frame state ------------------------------------------------------------------------
+static ULONGLONG s_tickMs = 0;              // last tick; the pad merge stops acting when this goes stale
+static int   s_camUp = -1;                  // the game's CamcorderState (1 = raised)
+// [FACECAM] A camera taken OFF his face with the hand (not with R3). It stays "at the face"
+// for the arm until it leaves the eye zone, so his right hand stays hidden the whole time the
+// player is holding it where the camera was - otherwise the empty open hand is drawn next to
+// the lens, which is the report this exists for.
+static bool  s_camGrabbedAtFace = false;
+static int   s_camRaw = -1;                 // the same, unnormalised (4/5 = the game is already reloading)
+static bool  s_camStarted = false;          // startup guard finished (camera stayed down, or gave up)
+static int   s_camGuardTicks = 0;           // startup guard: gameplay ticks spent keeping it down
+static bool  s_camStartLogged = false;      // the startup guard logged what it did
+static void* s_camGuardHero = nullptr;      // startup guard re-arms when the pawn changes (a new level)
+static ULONGLONG s_camDownSince = 0;        // when the camcorder was last seen down (startup guard)
+static ULONGLONG s_camStartToggleAt = 0;    // next allowed startup toggle pulse
+static bool  s_camSawUp = false;            // startup guard: the game had it raised at least once
+static const int kCamGuardTicks = 300;      // ~4 s at frame rate: outlasts the game's own startup raise
+static const ULONGLONG kCamGuardSettleMs = 1500;   // DOWN THIS LONG AFTER A RAISE = the startup state is over
+//  ...but the settle only applies when the game actually raised it. Waiting 1.5 s for a
+// camcorder that was never up held Miles's reference pose back on every normal level start, and the
+// arms only appeared after that: "sometimes when the game starts, my arms take a while to show up".
+static const ULONGLONG kCamGuardStartMs = 200;     // never raised: this much down is enough to start
+// [RELOAD] the game's own reload (Y) is playing: CCS_ReloadingActive / CCS_ReloadingInactive.
+static bool GameReloading() { return s_camRaw == 4 || s_camRaw == 5; }
+static float s_zoom = 0.0f, s_energy = 1.0f;
+static volatile float s_vfZoom = 0.0f;
+static volatile ULONGLONG s_vfMs = 0;
+static int   s_numBat = 0, s_prevNumBat = -1;
+// [CAMHUD] XR and gameplay may run on different threads. Publish the whole snapshot together.
+static SRWLOCK s_hudLock = SRWLOCK_INIT;
+static OLCamcorderHudState s_hudState;
+static ULONGLONG s_hudPublished = 0;
+static volatile LONG64 s_hudSubmitted = 0;
+extern "C" int OLUE3_CamcorderHudRead(float* seconds, int* capacity, int hide);
+//  night vision is the proxy's own camcorder state (raised + night vision requested), which
+// [HANDNV] keeps in step with the game's CamcorderMode. The HUD's eye and speaker tell-tales follow it.
+extern "C" int OLProxy_NightVisionActive();
+// (phase 8) THE MENU HIDES THE HUD NOW, not a second later.
+// Two delays stacked up here. The worker (which builds the composition layer every display frame)
+// only ever saw the snapshot CamcorderHudTick publishes on the GAME thread, so at 60 fps the menu
+// could be open for 16 ms before anything changed; and the snapshot's own freshness window was a
+// full second, so an entry published just before the menu opened stayed "fresh" long after it
+// closed. Both are answered here, from the worker side, without waiting for a game tick:
+//   * `g_hudHiddenNow`, set the instant a worker frame sees the menu open, hides it immediately;
+//   * the freshness window drops from 1 s to 250 ms, which is still many display frames of slack
+//     for a held frame but cannot outlive a menu opening.
+static volatile LONG g_hudHiddenNow = 0;
+extern "C" void OLInteract_RefreshCamHudMenu() {
+    const bool menu = OLUE3_InGameMenu() != 0 || OLMenu_Visible() != 0;
+    if (menu) InterlockedExchange(&g_hudHiddenNow, 1);
+}
+extern "C" int OLInteract_CamcorderHud(OLCamcorderHudState* state) {
+    AcquireSRWLockShared(&s_hudLock);
+    *state = s_hudState;
+    const bool fresh = s_hudState.visible && GetTickCount64() - s_hudPublished < 250;
+    ReleaseSRWLockShared(&s_hudLock);
+    if (g_hudHiddenNow) return 0;                  // the menu is open: nothing to draw, this frame
+    return g_camHud && fresh;
+}
+// [Render] CamcorderHud: 1 reworked (default), 2 focal square off, 3 battery only.
+extern "C" int OLInteract_GetCamcorderHud() { return g_camHud; }
+extern "C" void OLInteract_SetCamcorderHud(int style) {
+    g_camHud = style < 1 ? 1 : (style > 3 ? 3 : style);
+    char l[80]; sprintf_s(l, "[OLVR][CAMHUD] custom HUD style %ld", g_camHud); OLProxyLog(l);
+}
+extern "C" void OLInteract_CamcorderHudSubmitted(int shown) {
+    InterlockedExchange64(&s_hudSubmitted, shown ? (LONG64)GetTickCount64() : 0);
+}
+static void CamcorderHudTick(bool active) {
+    OLCamcorderHudState state;
+    const ULONGLONG submitted = (ULONGLONG)InterlockedCompareExchange64(&s_hudSubmitted, 0, 0);
+    const bool wanted = g_camHud && active && s_camUp == 1 && !OLUE3_InGameMenu() && !OLMenu_Visible();
+    const bool ready = OLUE3_CamcorderHudRead(&state.recordingSeconds, &state.capacity,
+        wanted && submitted && GetTickCount64() - submitted < 500);
+    state.energy = s_energy; state.zoom = s_zoom; state.spares = s_numBat; state.style = (int)g_camHud;
+    state.nightVision = OLProxy_NightVisionActive() != 0;
+    state.visible = wanted && ready;
+    const int status = !g_camHud ? 0 : !active ? 1 : s_camUp != 1 ? 2 : !wanted ? 3 : !ready ? 4 : 5;
+    static int lastStatus = -1;
+    if (status != lastStatus) {
+        static const char* messages[] = {
+            "[OLVR][CAMHUD] inactive: setting off", "[OLVR][CAMHUD] waiting for gameplay/data",
+            "[OLVR][CAMHUD] hidden: camcorder lowered", "[OLVR][CAMHUD] hidden: menu open",
+            "[OLVR][CAMHUD] waiting for camcorder movie/clock", "[OLVR][CAMHUD] publishing camcorder HUD"
+        };
+        OLProxyLog(messages[status]); lastStatus = status;
+    }
+    AcquireSRWLockExclusive(&s_hudLock);
+    s_hudState = state; s_hudPublished = GetTickCount64();
+    ReleaseSRWLockExclusive(&s_hudLock);
+    // (phase 8) the worker-side "menu is open" latch is released here, on the game thread, once a
+    // tick has actually seen the menu closed - whatever the HUD is doing. It must not be tied to
+    // `wanted`: a camcorder lowered while the menu was open would otherwise leave the latch set for
+    // the rest of the session, and the HUD would never come back when it is raised again.
+    if (!OLUE3_InGameMenu() && !OLMenu_Visible()) InterlockedExchange(&g_hudHiddenNow, 0);
+}
+static bool  s_gripDown[2] = { false, false };
+static bool  s_gripEdge[2] = { false, false };
+// requests to the pad merge
+static ULONGLONG s_camPulseUntil = 0, s_camCooldown = 0, s_reloadUntil = 0;
+static bool  s_blockGrip[2] = { false, false };
+static bool  s_nearKnob[2] = { false, false };
+static bool  s_nearDoorWide[2] = { false, false };   // near a knob: the right grip is the door's, not the camcorder's
+static bool  s_moving = false;
+static V3    s_anchorW[2] = {};                // [ANCHOR] (Test40) where each hand holds on (world)
+static float s_anchorWt[2] = { 0.0f, 0.0f };    // eased weight
+
+// ---- the body's facing (Test38) ------------------------------------------------------------------
+// Nothing tracks your torso, so it is estimated from the head: it stays put while you look around
+// within 35 degrees either side and is dragged along beyond that. The chest holster and the hip
+// pouch hang off it, so glancing sideways no longer swings them round with your head.
+static V3 s_torsoF = { 0.0f, 0.0f, -1.0f };
+static V3 s_headFwd = { 0.0f, 0.0f, -1.0f };   // the head's actual forward this frame (recenter frame)
+static bool s_torsoValid = false;
+static void TorsoUpdate(const OLXrPose& head) {
+    V3 f = QRot(head, { 0.0f, 0.0f, -1.0f }); f.y = 0.0f;
+    const float fl = sqrtf(f.x * f.x + f.z * f.z);
+    if (fl < 0.2f) return;                         // looking straight up or down: keep the last facing
+    f = Mul(f, 1.0f / fl);
+    if (!s_torsoValid) { s_torsoF = f; s_torsoValid = true; return; }
+    const float aH = atan2f(-f.x, -f.z), aT = atan2f(-s_torsoF.x, -s_torsoF.z);
+    float d = aH - aT;
+    while (d > 3.14159265f) d -= 6.2831853f; while (d < -3.14159265f) d += 6.2831853f;
+    const float lim = 35.0f * 3.14159265f / 180.0f;
+    if (d > lim) d -= lim; else if (d < -lim) d += lim; else return;
+    const float a = aT + d;
+    s_torsoF = { -sinf(a), 0.0f, -cosf(a) };
+}
+static V3 TorsoRight() { return { -s_torsoF.z, 0.0f, s_torsoF.x }; }
+static V3 OnBody(float right, float up, float fwd) {
+    return Add(s_headT, Add(Mul(TorsoRight(), right), Add(V3{ 0.0f, up, 0.0f }, Mul(s_torsoF, fwd))));
+}
+
+// ---- camcorder: holster, raise to your eye ---------------------------------------------------------
+static bool s_camByGesture = false;         // the mod raised it (and lowers it again)
+static ULONGLONG s_inEyeSince = 0;
+// One raise attempt per time the hand comes to the eye: a reload (or a cutscene) lowers the camcorder
+// while the hand is still there, and retrying every cooldown fought the game's own animation.
+static bool s_eyeArmed = true;
+static V3 s_eyeZone;
+static float s_dEye = 9.0f;
+//  [FACECAM] Hold the right stick click and the camcorder is raised by the game and
+// stays at Miles's face with the hand resting; the game's own arm plays its raise pose. Another
+// held click, or a squeeze at the face, runs the game's lower animation. A held click while it is
+// already up only pins it (no animation) and buzzes the right controller.
+static bool s_faceLock = false;              // the game's camcorder is up and pinned at his face
+//  A PHYSICAL grab really takes it off his face now. While this latch is set the
+// auto-pin at the end of the tick must NOT adopt the camera again - otherwise the very next frame
+// re-pinned it, the grab fired again (the grip is a LEVEL check), and the controller buzzed on every
+// frame without the camera ever leaving the face. That was the report: "vibrating continuously while
+// I hold the grip, but it cannot be grabbed".
+//  when the pin was put in place. The grab must not fire on the same gesture that pinned
+// it: taking the camera to your eye with the grip closed and pressing R3 pins it, and the level grip
+// check then "grabbed" it straight back off - the report "R3 lowers it instead of pinning".
+static bool s_facePending = false;           // a held click asked for the raise; waiting for the game
+static bool s_faceLowering = false;          // a held right stick click asked for the lower
+static ULONGLONG s_facePendingAt = 0, s_faceLowerAt = 0;
+// [FACECAM] how long the game's own lower animation is given before the controller arm may take
+// over again. CamcorderState reaches 0 the instant the lower starts; the arm pose lasts ~0.9 s.
+static const ULONGLONG kFaceLowerAnimMs = 900;
+// enter at the reach, lower 8 cm further out, re-arm 7 cm out
+static float EyeEnter() { return g_eyeReach; }
+static float EyeLeave() { return g_eyeReach + 0.08f; }
+static void RequestCamToggle(ULONGLONG now, ULONGLONG pulseMs) { s_camPulseUntil = now + pulseMs; s_camCooldown = now + pulseMs + 500; }
+
+// [HOLSTER] (Test39) Right hip: 20 cm right of the head's centre line, 60 cm below the eyes.
+static const V3 kHolsterOff = { 0.20f, -0.60f, 0.0f };    // right, up, forward (torso frame)
+//  [WAIST] The grab area is a waist-shaped box, not a 16 cm ball: a hand coming down
+// or across to the hip, and a hand resting in the lap when you play seated, both count. Measured
+// in the torso frame around the holster (and around the model the game draws, below).
+//  it is tighter horizontally: the old 34/26 cm forward/out reach let a hand held out in
+// front at waist height take the camcorder or the spare cell from the hip.
+static const float kWaistSideM = 0.22f, kWaistUpM = 0.20f, kWaistDownM = 0.32f,
+                   kWaistFwdM = 0.22f, kWaistBackM = 0.14f;
+static bool InWaistZone(V3 p, V3 center) {
+    const V3 d = Sub(p, center);
+    const V3 r = TorsoRight();
+    const float side = d.x * r.x + d.z * r.z;
+    const float fwd = d.x * s_torsoF.x + d.z * s_torsoF.z;
+    const float ns = side / kWaistSideM;
+    const float nu = d.y / (d.y >= 0.0f ? kWaistUpM : kWaistDownM);
+    const float nf = fwd / (fwd >= 0.0f ? kWaistFwdM : kWaistBackM);
+    return ns * ns + nu * nu + nf * nf <= 1.0f;
+}
+enum { H_HOLSTERED = 0, H_IN_HAND };
+static int s_hState = H_HOLSTERED;
+static float s_camBlend = 0.0f;              // 0 on the chest .. 1 in the hand (animated)
+static float s_blendSpeed = 5.5f;            // per second
+static V3 s_holster, s_holsterVis;          // where you reach (your chest) / where the model is drawn (his)
+static bool s_inHolster = false;
+static float s_dHolster = 9.0f;
+static ULONGLONG s_lastBlendMs = 0;
+static bool s_returnClick = false;
+static bool HolsterOn() { return g_on[ON_HOLSTER] != 0 && !g_camButton; }   // (Test49) [CAMBUTTON]: no hip
+
+static void CamRaise(ULONGLONG now, const OLXrPose& head, const OLXrFrameHands& fh) {
+    s_eyeZone = Add(s_headT, QRot(head, { 0.035f, -0.035f, -0.11f }));   // just in front of the right eye
+    const bool rOk = (fh.valid & 2u) != 0;
+    s_dEye = rOk ? Len(Sub(P3(fh.hand[1]), s_eyeZone)) : 9.0f;
+    // [FACECAM] the grab-off-the-face latch ends once the camera is carried out of the eye
+    // zone, with hysteresis (EyeLeave, not EyeEnter) so it cannot flicker at the boundary.
+    if (s_camGrabbedAtFace && s_dEye > EyeLeave()) s_camGrabbedAtFace = false;
+    if (s_dEye > EyeEnter() + 0.07f) s_eyeArmed = true;                       // the hand left the eye
+    //  [FACECAM] Pinned to the face by a held right stick click: the hand can rest, so
+    // the distance to the eye must not lower it.
+    // (V1) grabbing the pinned camcorder at the face with the right hand holds it physically - it is
+    // not removed. It only comes off his face with a held right stick click (the game's own lower
+    // animation) or when the game itself lowers it.
+    if (s_faceLock) {
+        // (V1) grabbing the pinned camcorder at the face with the right hand takes it off his face
+        // and into your hand (physical hold). It becomes visible in the hand instead of disappearing.
+        if (!s_faceLowering && s_gripEdge[1] && s_dEye < EyeLeave() && now > s_camCooldown) {
+            s_faceLock = false;
+            s_faceLowering = false;
+            s_eyeArmed = false; s_inEyeSince = 0;
+            s_camGrabbedAtFace = true;   // [FACECAM] held at the face by the hand, not by R3
+            // Put the camera visibly in the hand when physically grabbed from the face.
+            s_hState = H_IN_HAND; s_camBlend = 1.0f; s_blendSpeed = 1.0f / 0.18f;
+            OLXR_HapticPulse(1, 0.55f, 40);
+            ILog("[OLVR][FACECAM] camcorder taken off his face into your hand (%.2f m)", s_dEye);
+        }
+        s_inEyeSince = 0;
+        return;
+    }
+    if (s_facePending) { s_inEyeSince = 0; return; }   // the game's raise is playing
+    const bool holster = HolsterOn();
+    const bool allowed = holster ? (s_hState == H_IN_HAND) : (g_on[ON_RAISE] != 0 && !g_camButton);   // (Test49) no gesture
+    if (!allowed || s_camUp < 0) { s_inEyeSince = 0; return; }
+    if (s_camUp == 0) {
+        if (s_camByGesture && now > s_camCooldown) s_camByGesture = false;   // lowered some other way
+        if (s_dEye < EyeEnter() && s_eyeArmed) {
+            if (!s_inEyeSince) s_inEyeSince = now;
+            else if (now - s_inEyeSince > 140 && now > s_camCooldown) {
+                RequestCamToggle(now, 120); s_camByGesture = true; s_inEyeSince = 0; s_eyeArmed = false;
+                OLXR_HapticPulse(1, 0.55f, 40);
+                Learn(LN_RAISE);
+                ILog("[OLVR][INTERACT] camcorder RAISED by lifting the right hand to the eye (%.2f m)", s_dEye);
+            }
+        } else s_inEyeSince = 0;
+    } else if ((holster || s_camByGesture) && s_dEye > EyeLeave() && now > s_camCooldown) {
+        RequestCamToggle(now, 120); s_camByGesture = false;
+        OLXR_HapticPulse(1, 0.35f, 30);
+        ILog("[OLVR][INTERACT] camcorder LOWERED (right hand left the eye, %.2f m)", s_dEye);
+    }
+}
+
+//  [FACECAM] Hold the right stick click for OLVR_CAM_HOLD_MS. Handled on the game
+// thread with the frame's pad, but the proxy withholds the game's night-vision press until release
+// and only sends it for a short click, so a held click never flips night vision as a side effect.
+// [BATTERY] true while the game's reload animation plays (defined with the battery state below).
+static bool BatReloading();
+static bool s_rsDown = false, s_rsLong = false, s_rsShort = false;
+static ULONGLONG s_rsDownAt = 0;
+static void CamHoldGesture(ULONGLONG now, const OLXrPad& p) {
+    const bool rs = (p.buttons & OLXR_BTN_RSTICK) != 0;
+    if (rs && !s_rsDown) { s_rsDown = true; s_rsDownAt = now; s_rsLong = false; return; }
+    if (rs && s_rsDown) {
+        if (s_rsLong || now - s_rsDownAt < OLVR_CAM_HOLD_MS) return;
+        s_rsLong = true;
+        if (s_camUp < 0) { ILog("[OLVR][FACECAM] right stick held, but the game's camcorder state is not known yet"); return; }
+        if (s_camUp == 1) {
+            if (s_faceLock) {
+                if (!s_faceLowering) {
+                    s_faceLowering = true;
+                    s_faceLowerAt = now;
+                    s_eyeArmed = false; s_inEyeSince = 0;
+                    // [FACECAM] LOWERING A CAMCORDER AT HIS FACE TAKES THE HAND STATE BACK TO THE WAIST
+                    // FIRST. The game's lower animation starts here, and the tick returns for its whole
+                    // dwell (~0.9 s) BEFORE the Holster runs - so s_camBlend was never brought down during
+                    // it. Inheriting a held state (from a physical face grab: H_IN_HAND, blend 1) the model
+                    // was therefore still "in the hand" when the animation ended and only THEN glided to
+                    // the waist: "the camera still goes to Miles's hand after the lower animation
+                    // finishes". Dropping it the moment the lower starts means the end of the animation is
+                    // the waist, with no hand step at all.
+                    s_hState = H_HOLSTERED; s_camBlend = 0.0f; s_returnClick = false;
+                    s_lastBlendMs = 0;            // the Holster picks a fresh dt when it runs again
+                    RequestCamToggle(now, 300);   // longer pulse so the game's lower animation has time to play
+                    OLXR_HapticPulse(1, 0.65f, 45);
+                    ILog("[OLVR][FACECAM] right stick held: the camcorder comes off his face (the game's lower animation)");
+                }
+            } else {
+                s_faceLock = true; s_facePending = false; s_faceLowering = false;
+                s_camByGesture = false;
+                OLXR_HapticPulse(1, 0.65f, 45);
+                ILog("[OLVR][FACECAM] right stick held: the camcorder is pinned at his face (it was already up, no animation)");
+            }
+        } else {
+            s_facePending = true; s_facePendingAt = now; s_faceLowering = false;
+            s_camByGesture = false;
+            s_eyeArmed = false; s_inEyeSince = 0;
+            RequestCamToggle(now, 300);   // longer pulse so the game's raise animation has time to play
+            ILog("[OLVR][FACECAM] right stick held: Miles raises the camcorder - it will stay at his face");
+        }
+        return;
+    }
+    if (!rs && s_rsDown) {
+        s_rsDown = false;
+        if (!s_rsLong) s_rsShort = true;   // a short click: still the night-vision switch
+        s_rsLong = false;
+    }
+}
+
+static void Holster(ULONGLONG now, const OLXrFrameHands& fh) {
+    s_holster = OnBody(kHolsterOff.x, kHolsterOff.y, kHolsterOff.z);
+    float hv[3];
+    s_holsterVis = OLUE3_HolsterVisual(hv) ? V3{ hv[0], hv[1], hv[2] } : s_holster;
+    const bool rOk = (fh.valid & 2u) != 0;
+    // a grab counts at your own chest or at the model you see on Miles's chest
+    const float dReal = rOk ? Len(Sub(P3(fh.hand[1]), s_holster)) : 9.0f;
+    const float dVis = rOk ? Len(Sub(P3(fh.hand[1]), s_holsterVis)) : 9.0f;
+    s_dHolster = dReal < dVis ? dReal : dVis;
+    s_inHolster = rOk && (InWaistZone(P3(fh.hand[1]), s_holster) || InWaistZone(P3(fh.hand[1]), s_holsterVis));
+    const float dt = s_lastBlendMs ? (float)(now - s_lastBlendMs) * 0.001f : 0.0f;
+    s_lastBlendMs = now;
+    if (!HolsterOn() || s_camUp < 0) { s_hState = H_HOLSTERED; s_camBlend = 0.0f; return; }
+    if (s_hState == H_HOLSTERED) {
+        if (s_gripEdge[1] && s_inHolster && !s_nearDoorWide[1]) {
+            s_hState = H_IN_HAND; s_blendSpeed = 1.0f / 0.18f; s_returnClick = false;
+            s_gripEdge[1] = false;                                   // the squeeze is used: no door grab
+            OLXR_HapticPulse(1, 0.5f, 35);
+            Learn(LN_TAKECAM);
+            ILog("[OLVR][HOLSTER] camcorder taken from the hip holster (%.2f m)", s_dHolster);
+        }
+        // It went back to the holster while up at your eye: lower it once the last toggle settled.
+        if (s_camUp == 1 && s_camByGesture && now > s_camCooldown) {
+            RequestCamToggle(now, 120); s_camByGesture = false;
+            ILog("[OLVR][HOLSTER] camcorder lowered - it is back on your hip");
+        }
+    } else if ((!s_gripDown[1] || !rOk) && !BatReloading() && !GameReloading()) {
+        // During a reload animation (ours or the game's own) the camcorder stays in Miles's hand, so
+        // releasing the right grip mid-reload must not send it back to the hip.
+        s_hState = H_HOLSTERED; s_blendSpeed = 1.0f / 0.28f; s_returnClick = true;
+        if (s_camUp == 1 && s_camByGesture && now > s_camCooldown) { RequestCamToggle(now, 120); s_camByGesture = false; }
+        OLXR_HapticPulse(1, 0.25f, 20);
+        ILog("[OLVR][HOLSTER] camcorder let go - gliding back to the hip holster");
+    }
+    const float target = s_hState == H_IN_HAND ? 1.0f : 0.0f;
+    if (s_camBlend < target) { s_camBlend += dt * s_blendSpeed; if (s_camBlend > target) s_camBlend = target; }
+    else if (s_camBlend > target) {
+        s_camBlend -= dt * s_blendSpeed;
+        if (s_camBlend <= target) {
+            s_camBlend = target;
+            if (s_returnClick) { s_returnClick = false; OLXR_HapticPulse(1, 0.45f, 18); }   // it clicks into place
+        }
+    }
+}
+
+// ---- [BATTERY]  the spare cell on the left hip ------------------------------------------
+// The battery is a small StaticMesh the mod spawns and hangs from Miles's left thigh bone, exactly
+// like the camcorder hangs from his right hand. It is hidden while holstered. Squeeze the left grip
+// at the left hip and it glides into your left hand. Bring that hand to the camcorder in your right
+// hand and the game's own reload animation plays on both arms - the mod does not press Y, so it also
+// works when the camcorder is not pinned to your face. When the animation ends the cell is swapped
+// in code (one spare used, a full battery set) and the held model fades back to the hip.
+enum { BAT_NONE = 0, BAT_HELD, BAT_FADE };
+static int   s_batState = BAT_NONE;
+static float s_batBlend = 0.0f;             // 0 on the hip .. 1 in the left hand
+static float s_batAlpha = 0.0f;             // 0 invisible .. 1 shown
+static float s_dBat = 9.0f;
+static bool  s_batInHip = false;
+static V3    s_batHip, s_batHipVis;
+static ULONGLONG s_batFadeAt = 0;
+static bool  s_batReloading = false;
+static bool  s_batPreview = false;          // the menu's "preview" plays the animation without swapping
+static ULONGLONG s_batReloadAt = 0;
+static float s_batReloadDur = 0.0f;
+static void* s_batHero = nullptr;
+static V3    s_camModel;
+static float s_dCamL = 9.0f;
+static ULONGLONG s_nearCamAt = 0;
+static bool  s_camNearArmed = true;
+static ULONGLONG s_batEmptyPulseAt = 0;    // second of the two quick "empty" buzzes
+static ULONGLONG s_batEmptyCooldown = 0;
+static bool BatReloading() { return s_batReloading; }
+// The hip reach is the camcorder's waist zone mirrored to the left side, so seated play and a hand
+// coming down or across to the hip both count.
+static const V3 kBatHipOff = { -0.20f, -0.60f, 0.0f };
+
+static void BatterySwap(ULONGLONG now) {
+    (void)now;
+    if (s_batPreview) {   // the menu preview: play the animation, do not touch the batteries
+        s_batPreview = false;
+        s_batReloading = false;
+        s_batState = BAT_NONE; s_batBlend = 0.0f; s_batAlpha = 0.0f;
+        s_nearCamAt = 0; s_camNearArmed = false;
+        ILog("[OLVR][BATTERY] reload preview finished");
+        return;
+    }
+    void* hero = OLUE3_Hero();
+    void* pc = OLUE3_PlayerController();
+    int n = 0;
+    if (Rd(pc, F.numBat, &n)) {
+        if (n > 0) --n;
+        WrI(pc, F.numBat, n);
+        s_numBat = n;
+    }
+    if (WrF(hero, F.energy, 1.0f)) s_energy = 1.0f;
+    s_batReloading = false;
+    s_batState = BAT_NONE; s_batBlend = 0.0f; s_batAlpha = 0.0f;
+    s_nearCamAt = 0; s_camNearArmed = false;   // the hand must leave the camcorder first
+    OLXR_HapticPulse(0, 0.65f, 45); OLXR_HapticPulse(1, 0.85f, 65);
+    ILog("[OLVR][BATTERY] reload animation finished - a fresh battery set is in (%d spare%s left)", s_numBat, s_numBat == 1 ? "" : "s");
+}
+static void BatteryStartReload(ULONGLONG now, float d) {
+    if (s_batReloading) return;
+    if (s_numBat <= 0) {
+        s_camNearArmed = false;
+        OLXR_HapticPulse(0, 0.9f, 30);
+        ILog("[OLVR][BATTERY] no spare batteries - the camcorder keeps the one it has");
+        return;
+    }
+    const float dur = OLUE3_BeginBatteryReload(s_camRaw == 1 ? 0 : 1);   // lowered = the "inactive" reload anim
+    if (!(dur > 0.0f)) {
+        s_camNearArmed = false;
+        ILog("[OLVR][BATTERY] the game's reload animation could not be started - Y still reloads");
+        return;
+    }
+    s_batReloading = true;
+    s_batReloadAt = now;
+    s_batReloadDur = dur + 0.05f;   // the frame after the last one, not on top of the final pose
+    s_batHero = OLUE3_Hero();
+    s_nearCamAt = 0;
+    if (s_batState == BAT_HELD) { s_batState = BAT_FADE; s_batFadeAt = now; }
+    OLXR_HapticPulse(0, 0.55f, 40); OLXR_HapticPulse(1, 0.35f, 30);
+    ILog("[OLVR][BATTERY] left hand at the camcorder (%.2f m): the game's reload animation plays (%.2fs)", d, dur);
+}
+// [RELOAD]  Y with the camcorder in hand. At the face the game's own reload keeps the
+// camera raised (you look through it), so the mod suppresses that Y, lowers the camcorder first and
+// then runs the visible (inactive) reload. Lowered, the game gets Y; if it does not start within a
+// moment, the mod runs the same animation + swap.
+static ULONGLONG s_yReloadAt = 0, s_yLowerAt = 0;
+static bool s_yDown = false, s_yWaitLower = false;
+static ULONGLONG s_yEmptyPulseAt = 0;          // [DOCUMENT] second of the two quick "empty" buzzes on Y
+static void YReload(ULONGLONG now, const OLXrPad& p) {
+    // The second of the two quick "empty" buzzes when Y is pressed at the face with no spare batteries.
+    if (s_yEmptyPulseAt && now >= s_yEmptyPulseAt) {
+        s_yEmptyPulseAt = 0;
+        OLXR_HapticPulse(1, 0.9f, 30);
+    }
+    const bool yDown = (p.buttons & OLXR_BTN_Y) != 0;
+    const bool yEdge = yDown && !s_yDown;
+    s_yDown = yDown;
+    if (yEdge && !s_batReloading && !GameReloading() && (s_hState == H_IN_HAND || s_camUp == 1) && !s_gripDown[0]) {
+        if (s_numBat <= 0) {                 // nothing to swap: no lower
+            if (s_camUp == 1) {              // at the face (held or pinned): two quick buzzes, one after the other
+                s_yEmptyPulseAt = now + 170;
+                OLXR_HapticPulse(1, 0.9f, 30);
+                ILog("[OLVR][RELOAD] Y pressed at the face but there are no spare batteries - two quick buzzes");
+            } else {
+                OLXR_HapticPulse(1, 0.7f, 30);
+                ILog("[OLVR][RELOAD] Y pressed but there are no spare batteries - the camcorder stays as it is");
+            }
+            return;
+        }
+        if (s_camUp == 1) {                 // at the face: lower it so the animation is visible
+            RequestCamToggle(now, 300);
+            s_yLowerAt = now; s_yWaitLower = true;
+            ILog("[OLVR][RELOAD] Y at the face - lowering the camcorder for a visible reload");
+        } else {
+            s_yReloadAt = now;
+        }
+    }
+    if (s_yWaitLower) {
+        if (now - s_yLowerAt > 1800 || (!s_batReloading && s_camRaw == 0)) {   // fully lowered, then reload
+            s_yWaitLower = false;
+            if (!s_batReloading) BatteryStartReload(now, 0.0f);
+        }
+    }
+    if (!s_yReloadAt) return;
+    if (GameReloading()) { s_yReloadAt = 0; return; }   // the game's own Y reload started - use it
+    if (now - s_yReloadAt > 250) {
+        s_yReloadAt = 0;
+        if (!s_batReloading) BatteryStartReload(now, 0.0f);
+    }
+}
+// [BATTERY] queued from the menu (the button is gone, but the request path stays harmless).
+static volatile long s_batPreviewReq = 0;
+extern "C" void OLInteract_PreviewReload() {
+    if (s_batReloading) return;
+    InterlockedExchange(&s_batPreviewReq, 1);
+}
+static void Battery(ULONGLONG now, float dt, const OLXrFrameHands& fh, const OLXrPad& p) {
+    s_batHip = OnBody(kBatHipOff.x, kBatHipOff.y, kBatHipOff.z);
+    float hv[3];
+    s_batHipVis = OLUE3_BatteryVisual(hv) ? V3{ hv[0], hv[1], hv[2] } : s_batHip;
+    const bool lOk = (fh.valid & 1u) != 0, rOk = (fh.valid & 2u) != 0;
+    const V3 L = P3(fh.hand[0]), R = P3(fh.hand[1]);
+    s_moving = sqrtf(p.moveX * p.moveX + p.moveY * p.moveY) > 0.35f;
+    const float dReal = lOk ? Len(Sub(L, s_batHip)) : 9.0f;
+    const float dVis = lOk ? Len(Sub(L, s_batHipVis)) : 9.0f;
+    s_dBat = dReal < dVis ? dReal : dVis;
+    s_batInHip = lOk && (InWaistZone(L, s_batHip) || InWaistZone(L, s_batHipVis));
+
+    // The second of the two quick "empty" buzzes (the first fires on the squeeze itself).
+    if (s_batEmptyPulseAt && now >= s_batEmptyPulseAt) {
+        s_batEmptyPulseAt = 0;
+        OLXR_HapticPulse(0, 0.9f, 30);
+    }
+
+    // The game's animation is playing: both arms and the grips belong to it.
+    if (s_batReloading) {
+        if (s_batHero && s_batHero != OLUE3_Hero()) {
+            s_batReloading = false; s_batPreview = false; s_batState = BAT_NONE; s_batAlpha = 0.0f;
+            ILog("[OLVR][BATTERY] reload cancelled - Miles changed");
+        } else if (now - s_batReloadAt >= (ULONGLONG)(s_batReloadDur * 1000.0f)) {
+            BatterySwap(now);
+        }
+    }
+    if (s_batState == BAT_FADE) {
+        const float t = (float)(now - s_batFadeAt) * 0.001f;
+        const float k = t / 0.30f;                     // the held cell fades out and returns to the hip
+        s_batAlpha = k >= 1.0f ? 0.0f : 1.0f - k;
+        s_batBlend = k >= 1.0f ? 0.0f : 1.0f - k * k * (3.0f - 2.0f * k);
+        if (k >= 1.0f) { s_batState = BAT_NONE; s_batAlpha = 0.0f; s_batBlend = 0.0f; }
+    } else if (s_batState == BAT_HELD) {
+        s_batAlpha = 1.0f;
+        s_batBlend += dt * 6.0f;                        // ~0.17 s from the hip into the hand
+        if (s_batBlend > 1.0f) s_batBlend = 1.0f;
+    } else {
+        s_batBlend = 0.0f; s_batAlpha = 0.0f;
+    }
+
+    if (!HolsterOn() || s_camUp < 0) {
+        if (s_batState != BAT_NONE) ILog("[OLVR][BATTERY] holster off - the battery goes back to the hip");
+        s_batState = BAT_NONE; s_batBlend = 0.0f; s_batAlpha = 0.0f;
+        s_batReloading = false; s_batPreview = false;
+        return;
+    }
+
+    // Reload: with the camcorder held in the right hand, the left hand coming up to it starts the
+    // game's animation. No button, no ToggleCamcorder, no Y - the camera need not be at the face.
+    if (!s_batReloading) {
+        // A reload starts only while a cell is actually in the left hand; after one reload the hand is
+        // empty again, so the next reload needs another trip to the left hip.
+        const bool canReload = s_hState == H_IN_HAND && s_camRaw == 0 && s_camBlend > 0.90f && lOk &&
+                               s_batState == BAT_HELD;
+        if (canReload) {
+            float cp[3];
+            if (OLUE3_CamModelVisual(cp)) s_camModel = V3{ cp[0], cp[1], cp[2] };
+            else s_camModel = rOk ? R : Add(L, V3{ 0.0f, 0.0f, 0.15f });
+            s_dCamL = Len(Sub(L, s_camModel));
+            if (s_dCamL < 0.18f) {
+                if (!s_nearCamAt) s_nearCamAt = now;
+                else if (now - s_nearCamAt > 120 && s_camNearArmed) BatteryStartReload(now, s_dCamL);
+            } else {
+                s_nearCamAt = 0;
+                if (s_dCamL > 0.28f) s_camNearArmed = true;
+            }
+        } else {
+            s_nearCamAt = 0;
+            if (s_dCamL > 0.28f || s_hState != H_IN_HAND) s_camNearArmed = true;
+        }
+    }
+
+    if (s_batReloading) return;
+    if (s_batState == BAT_NONE) {
+        // Squeeze at the left hip. A hand that is sprinting (the stick pushed) or on a door is not
+        // reaching for the spare: leave those alone.
+        if (s_gripEdge[0] && s_batInHip && !s_moving && !s_nearDoorWide[0]) {
+            s_gripEdge[0] = false;
+            if (s_numBat > 0) {
+                s_batState = BAT_HELD; s_batBlend = 0.0f; s_batAlpha = 1.0f;
+                OLXR_HapticPulse(0, 0.55f, 35);
+                ILog("[OLVR][BATTERY] spare battery taken from the left hip (%d left, %.2f m)", s_numBat, s_dBat);
+            } else if (now >= s_batEmptyCooldown) {
+                s_batEmptyCooldown = now + 700;
+                s_batEmptyPulseAt = now + 170;
+                OLXR_HapticPulse(0, 0.9f, 30);   // first buzz; the second comes after s_batEmptyPulseAt
+                ILog("[OLVR][BATTERY] the left hip is EMPTY (no spare batteries)");
+            }
+        }
+    } else if (s_batState == BAT_HELD && (!s_gripDown[0] || !lOk)) {
+        // Let go: no visible cell in mid-air; it is back on the hip.
+        s_batState = BAT_NONE; s_batBlend = 0.0f; s_batAlpha = 0.0f;
+        OLXR_HapticPulse(0, 0.25f, 20);
+        ILog("[OLVR][BATTERY] battery let go - back on the left hip");
+    }
+}
+
+// ---- [DOCUMENT]  the confidential document on the left shoulder --------------------------
+// A flat document StaticMesh hangs from Miles's left shoulder bone, exactly like the spare battery
+// hangs from his left thigh. It is hidden while it rests there. Squeeze the left grip at the left
+// shoulder and it glides into your left hand; let go and it goes back. Look at the held document for
+// a moment and the DOCUMENTS list opens (D-pad right = ShowEvidenceMenu), and the document returns
+// to his shoulder - no separate shortcut needed to read it. (Left grip + Y does the same from the
+// controller, see MapPadButtons; left grip + X is the notes list and left trigger + Y the notebook.)
+enum { DOC_NONE = 0, DOC_HELD };
+static int   s_docState = DOC_NONE;
+static float s_docBlend = 0.0f;              // 0 on the shoulder .. 1 in the left hand
+static float s_docAlpha = 0.0f;              // 0 invisible .. 1 shown
+static float s_dDoc = 9.0f;
+static bool  s_docInShoulder = false;
+static V3    s_docShoulder, s_docShoulderVis;
+static ULONGLONG s_docLookAt = 0;            // how long the head has been looking at the held document
+static ULONGLONG s_docMenuPulseUntil = 0;    // the documents pulse (D-pad right) sent to the game
+// The left shoulder in the torso frame: 15 cm left, 16 cm below the eyes, a touch forward.
+static const V3 kDocShoulderOff = { -0.15f, -0.16f, 0.02f };
+static const float kDocGrabM = 0.15f;        // how close the left hand must come to grab it (focused on the shoulder)
+static const float kDocLookCos = 0.965f;     // ~15 deg half-angle of "looking at" the document (a small target)
+static const float kDocLookOffLeft = 0.05f;  // the look target sits this far left of the mesh origin so it is centred on the sheet
+static const ULONGLONG kDocLookMs = 800;     // how long to look before the notebook opens
+
+static void Document(ULONGLONG now, float dt, const OLXrFrameHands& fh, const OLXrPad& p) {
+    s_docShoulder = OnBody(kDocShoulderOff.x, kDocShoulderOff.y, kDocShoulderOff.z);
+    float sv[3];
+    s_docShoulderVis = OLUE3_DocumentVisual(sv) ? V3{ sv[0], sv[1], sv[2] } : s_docShoulder;
+    const bool lOk = (fh.valid & 1u) != 0;
+    const V3 L = P3(fh.hand[0]);
+    const float dReal = lOk ? Len(Sub(L, s_docShoulder)) : 9.0f;
+    const float dVis = lOk ? Len(Sub(L, s_docShoulderVis)) : 9.0f;
+    s_dDoc = dReal < dVis ? dReal : dVis;
+    s_docInShoulder = lOk && s_dDoc < kDocGrabM;
+
+    if (!HolsterOn() || s_camUp < 0 || OLUE3_InGameMenu()) {
+        if (s_docState != DOC_NONE)
+            ILog("[OLVR][DOCUMENT] interactions paused - the document goes back to the left shoulder");
+        s_docState = DOC_NONE; s_docBlend = 0.0f; s_docAlpha = 0.0f; s_docLookAt = 0;
+        return;
+    }
+
+    if (s_docState == DOC_HELD) {
+        s_docAlpha = 1.0f;
+        s_docBlend += dt * 6.0f;                 // ~0.17 s from the shoulder into the hand
+        if (s_docBlend > 1.0f) s_docBlend = 1.0f;
+    } else {
+        s_docBlend = 0.0f; s_docAlpha = 0.0f;
+    }
+
+    if (s_docState == DOC_NONE) {
+        // Squeeze at the left shoulder. Not while sprinting, on a door, or holding a battery (the
+        // same guard as the spare battery at the hip).
+        if (s_gripEdge[0] && s_docInShoulder && !s_moving && !s_nearDoorWide[0] && s_batState == BAT_NONE) {
+            s_gripEdge[0] = false;
+            s_docState = DOC_HELD; s_docBlend = 0.0f; s_docAlpha = 1.0f; s_docLookAt = 0;
+            OLXR_HapticPulse(0, 0.55f, 35);
+            ILog("[OLVR][DOCUMENT] confidential document taken from the left shoulder (%.2f m)", s_dDoc);
+        }
+    } else if (s_docState == DOC_HELD) {
+        if (!s_gripDown[0] || !lOk) {
+            // Let go: the document is back on the shoulder, invisible.
+            s_docState = DOC_NONE; s_docBlend = 0.0f; s_docAlpha = 0.0f; s_docLookAt = 0;
+            OLXR_HapticPulse(0, 0.25f, 20);
+            ILog("[OLVR][DOCUMENT] document let go - back on the left shoulder");
+            return;
+        }
+        // Look at the held document for a moment: open the documents menu and stow it. Aim at the
+        // document's actual centre (hand + held offset), not the hand it hangs from.
+        V3 docPos = L;
+        float dh[3];
+        if (OLUE3_DocumentHandVisual(dh)) docPos = V3{ dh[0], dh[1], dh[2] };
+        docPos.x -= kDocLookOffLeft;   // centre the look target on the sheet (it sits left of the mesh origin)
+        const V3 toDoc = Sub(docPos, s_headT);
+        const float dLen = Len(toDoc);
+        if (dLen > 0.05f) {
+            const V3 dir = Mul(toDoc, 1.0f / dLen);
+            const float dot = dir.x * s_headFwd.x + dir.y * s_headFwd.y + dir.z * s_headFwd.z;
+            if (dot > kDocLookCos) {
+                if (!s_docLookAt) s_docLookAt = now;
+                else if (now - s_docLookAt >= kDocLookMs) {
+                    s_docLookAt = 0;
+                    s_docMenuPulseUntil = now + 120;   // D-pad right = OLA_ShowEvidenceMenu (documents)
+                    s_docState = DOC_NONE; s_docBlend = 0.0f; s_docAlpha = 0.0f;
+                    OLXR_HapticPulse(0, 0.7f, 45);
+                    ILog("[OLVR][DOCUMENT] looked at the document - opening the documents/notes notebook");
+                }
+            } else s_docLookAt = 0;
+        } else s_docLookAt = 0;
+    }
+}
+
+// ---- doors (Test40: [DOORPHYS] a hinged body with weight) --------------------------------------------
+// Test39 wrote TargetOpenRatio and let OLDoor's tick chase it at a constant CurrentSpeed: a robot swing
+// that lagged a fast hand, stopped dead, and jumped when a hand started past the panel's edge. Now a
+// door a hand touches is a heavy hinged body - an angle, an angular speed and hinge friction:
+//  - push: the panel is a contact. It cannot move away faster than its weight lets your hand speed it
+//    up (Miles's hand stops at its surface meanwhile), and when your hand stops it keeps its speed and
+//    slows down by itself: a shove swings it on a little, a slow push creeps it open.
+//  - handle: a stiff spring between the handle and your hand. The door lags a touch behind a fast pull
+//    and swings on when you let go mid-swing. Miles's hand stays on the handle.
+//  - it stops against Miles instead of passing through him, bounces softly off its open stop and
+//    latches when it swings shut.
+// The angle goes in through the game's own set-ratio (0xCC46A0: angle, target and the AI's navmesh
+// obstacle together - OLDoor's procedural swings call it every tick), so its tick has nothing left to
+// chase. Whatever the game does with a door itself - X, an AI going through, a script, a locked
+// rattle - takes it straight back.
+struct NearDoor { void* d; V3 knob, hinge; float ratio, maxAng; bool locked, rev, cant, busy; float dist; unsigned char mat; };
+static void* s_all[512]; static int s_allN = 0; static ULONGLONG s_allMs = 0;
+static NearDoor s_near[12]; static int s_nearN = 0;
+static V3 s_handW[2]; static bool s_handOk[2] = { false, false };   // this tick's hands in the world
+struct Grab { void* d; float lastR; float yaw; };   //  yaw: the body's facing when it took hold
+static Grab s_grab[2] = {};
+static ULONGLONG s_lockedFlashUntil = 0; static void* s_lockedDoor = nullptr;
+static ULONGLONG s_lockedPulseAt[2] = { 0, 0 };   // the second of the two quick "locked" buzzes
+//  the grab area is a touch larger so the handle is easier to take; it still does not
+// catch a hand that is merely passing the door.
+static const float kGrabUU = 32.0f, kSlipUU = 64.0f;  // the hand must be at the handle
+//  LIVE-TUNABLE HAND COLLISION ([DOOR] menu section).
+// The hand/panel collision is an approximation of a body that is not modelled, so the honest thing is
+// to let the player dial it in while playing: how far the wrist is held off a panel, and how close a
+// hand has to come before the door notices it at all. (The old hand-on-knob trim is gone: the anchor
+// is back to the shipped knob point, so those numbers moved nothing.)
+extern "C" void OLInteract_GetHandPlacement(float* depth, float* reach) {
+    if (depth) *depth = g_pushDepthUU;
+    if (reach) *reach = g_contactUU;
+}
+extern "C" void OLInteract_SetHandPlacement(float depth, float reach) {
+    if (depth > 0.0f) g_pushDepthUU = depth < 2.0f ? 2.0f : (depth > 40.0f ? 40.0f : depth);
+    if (reach > 0.0f) g_contactUU = reach < 4.0f ? 4.0f : (reach > 40.0f ? 40.0f : reach);
+}
+extern "C" void OLInteract_ResetHandPlacement() {
+    g_pushDepthUU = kPushDepthUUShipped;
+    g_contactUU = kContactUUShipped;
+}
+static const float kDoorWideUU = 80.0f;   // near enough that the right grip belongs to the door, not the camcorder
+//  [DOORLETGO] ... the handle is also let go once the body has turned away, the knob is out of reach, or behind Miles.
+static const float kLetGoTurnDeg = 45.0f, kLetGoReachUU = 95.0f;
+static const float kPushAccel = 1600.0f;                 // deg/s^2 a hand can give a heavy door
+static const float kFricVisc = 1.1f, kFricCoul = 22.0f;  // hinge friction: lighter door, easier to move
+// [DOOR] open-hand collision box: keeps the whole hand (wrist + fingers) off the door panel when
+// pushing with an open hand.
+static const float kFingerLenUU = 14.0f;   // wrist to fingertips (uu)
+static const float kHandWidthUU = 10.0f;   // hand half-width (uu)
+// [DOOR] hold-and-pull tuning. The handle no longer copies the hand's ANGLE around the hinge: the hand's
+// own travel along the knob's opening tangent is scaled into door degrees. That gives the arm its
+// amplitude (a 50 cm pull can swing a 95 deg door all the way) and the same pull always gives the same
+// rotation, wherever the hand is around the hinge. The spring is deliberately soft: the door follows the
+// hand's acceleration and speed instead of snapping to the target, so a tiny pull no longer flings it.
+static const float kGrabDeadzone = 6.0f;     // small hand wiggles do not move the door (mask bad placements)
+static const float kHandleGain = 1.7f;       // door degrees per uu of hand travel along the opening tangent
+static const float kHandleK = 110.0f, kHandleC = 18.0f;  // how softly the door follows that target
+static const float kHandleVelGain = 0.8f;    // deg/s^2 per (uu/s) of hand speed (angular acceleration with hand speed)
+static const float kHandleMaxOm = 150.0f;    // deg/s the hand can swing it at most (no zip)
+//  The old 60 cm hand-travel release constant is gone: a closed grip no longer lets go of the
+// knob by pulling the hand away from it (see the let-go checks in Doors()).
+static const float kAutoOpenRatio = 0.70f;   // let go past this (still opening) -> the door finishes opening
+static const float kAutoCloseMove = 24.0f;   // pulled/pushed this far toward closing at let-go -> it closes by itself
+static const float kOpenSwing = 60.0f;       // deg/s used to finish an auto-open / auto-close
+static const float kHandleFaceUU = 6.0f;     // handle-to-handle depth of a door (the second knob is on the other face)
+// [DOOR] how far BELOW the knob's centre the magnet guides the hand (uu). Small: the palm should cover
+// the knob, not sit under it. Raise this number to move the hand lower on the handle.
+static const float kHandleGuideDownUU = 2.0f;
+static const float kSndSpeed = 5.0f;         // deg/s; slower than this and it is only a nudge / a held door
+static const ULONGLONG kSndBlockMs = 1200;   // no new door movement sound for this long after one
+static const ULONGLONG kSndCloseCutMs = 700; // cut the tail early; the stop fades out over ~400 ms
+// [DOOR] max arm reach: once the hand is this far from the grab point the door no longer follows it
+// (the arm is fully extended, so the door stops moving instead of the hand staying behind).
+static const float kMaxArmReachUU = 95.0f;   // cm beyond which the door stops following the hand
+// [DOOR] after letting go of a held door, keep that hand out of the push loop for a moment so the
+// door can swing through it (it was just keeping the door from finishing its travel).
+static const ULONGLONG kPushSuppressMs = 2500;
+// [DOORPUSH] which side of which door each open hand is on (0 = not on any panel)
+static void* s_pushDoor[2] = { nullptr, nullptr };
+static int   s_pushSide[2] = { 0, 0 };
+static ULONGLONG s_pushLockedMs = 0;
+static ULONGLONG s_pushSuppressUntil[2] = { 0, 0 };   // [DOOR] no push from a hand that just let go of a door
+static float s_gripW[2] = { 0.0f, 0.0f };     // [DOORGRIP] eased
+struct DoorSim { void* d; float om, lastCmd, lastHapR; bool live; bool pushed; ULONGLONG ms; float startR; bool evOpen, sndOpened, sndClosed; bool autoRun; float autoTo; ULONGLONG gameUntil; int sndDir; float sndFrom; ULONGLONG sndBlockUntil, sndCloseCut; unsigned char sndMat; };
+// [DOOR] the material event name for a door, so the fade-out can stop the event that is playing.
+static const char* DoorSoundName(unsigned char mat) {
+    static const char* const kMatSnd[3] = { "EV_Opening_Wood_Door", "EV_Opening_Metal_Door", "EV_Opening_Security_Door" };
+    return kMatSnd[mat <= 2 ? mat : 0];
+}
+// [DOOR] The door movement event names per material, best first. The door work used more than one
+// name for the same event ("EV_Push_Wood_Door" / "EV_Opening_Wood_Door"), and a name this build does
+// not carry used to fail silently - a door with no sound and nothing in the log. The sound layer
+// posts the first of these that exists and says which one it used (OLSound_PostFirstOf in
+// ol_sound.cpp), so the doors have their sound whether this build names the event one way or the other.
+static const char* const kSndWood[2]     = { "EV_Opening_Wood_Door", "EV_Push_Wood_Door" };
+static const char* const kSndMetal[2]    = { "EV_Opening_Metal_Door", "EV_Opening_Wood_Door" };
+static const char* const kSndSecurity[2] = { "EV_Opening_Security_Door", "EV_Opening_Metal_Door" };
+static const char* const* DoorSoundCandidates(unsigned char mat, int* n) {
+    *n = 2;
+    return mat == 2 ? kSndSecurity : (mat == 1 ? kSndMetal : kSndWood);
+}
+// [DOOREVENT] (Test43) What the game's own door code does as a door opens and closes (OLGame.exe):
+//  open  (AOLDoor 0xD4A770, the door's "open" for X, AI and scripts): if DoorState is 0 (shut) it fires
+//        TriggerEvent(0), sets DoorState 1, and fires TriggerEvent(1).
+//  close (0xD58AEB): TriggerEvent(2), DoorState 2 until it is shut again (0).
+// TriggerEvent(n) activates output n of the door's OLSeqEvent_Door Kismet events - what the level
+// scripts' scares listen to. The hand physics moved the door straight through 0xCC46A0 and did none of
+// it: the first scare at a door never came. Now a door the hands open from shut, and one they swing
+// shut, go through the same steps.
+static bool WrB(void* base, unsigned off, unsigned char v) {
+    if (!base || !off) return false;
+    __try { *(volatile unsigned char*)((char*)base + off) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static DoorSim s_sim[6] = {};
+static V3 s_doorAnchor[2]; static bool s_doorAnchorOn[2] = { false, false };
+static ULONGLONG s_doorAnchorMs[2] = { 0, 0 };       // [DOOR] time the anchor was set (align then release)
+static bool  s_doorAnchorFixed[2] = { false, false }; // [DOOR] anchor frozen at grab time, not re-tracked by the door
+// [DOOR] this hand has just let go of a KNOB: its anchor is dropped at once, so the hand does not stay
+// stuck to the handle for the ~0.5 s the released weight would otherwise take to decay.
+static bool  s_doorLetGoKnob[2] = { false, false };
+static volatile long s_devDoorEv = -1;
+// [DOOR] a hand that grabs the handle is anchored at a fixed world point so Miles's hand never wanders into
+// the door or between two knobs; small wiggles inside the deadzone are masked.
+static V3   s_grabFixPt[2] = {{0,0,0},{0,0,0}};   // world point the hand is pinned to while holding the knob
+static bool  s_grabFixed[2] = {false,false};      // true while the current grab uses a fixed anchor
+static V3    s_grabTan[2] = {{0,0,0},{0,0,0}};    // world unit along which the knob moves as the door opens
+static float s_grabA0[2] = {0.0f,0.0f};           // door angle at the grab (deg)
+static float s_grabS[2] = {0.0f,0.0f};            // hand travel along that tangent since the grab (uu, + opens)
+static float s_grabSPrev[2] = {0.0f,0.0f};
+static int   s_grabSide[2] = {1,1};               // which face of the door the palm is on
+static V3    s_grabKnobCenter[2] = {{0,0,0},{0,0,0}}; // [DOOR] center point of the knob at grab time (the anchor's height)
+static float s_anchorYaw[2] = {0.0f,0.0f};        // door swing since the grab, for the locked wrist
+static bool  s_anchorLock[2] = {false,false};     // true while the wrist is pinned to the door, not the controller
+static ULONGLONG s_grabHapUntil[2] = {0,0};       // light buzz while a hand is holding a knob
+extern "C" void OLInteract_DevDoorEvent(int type) { InterlockedExchange(&s_devDoorEv, type); }   // [DEVBRIDGE] "doorev"
+
+static bool ReadDoor(void* d, NearDoor* o) {
+    unsigned char type = 0; uint32_t bits = 0;
+    if (!Rd(d, F.dtype, &type) || type > 2) return false;             // 0 wood / 1 metal / 2 security; lockers etc. stay native
+    if (!Rd(d, F.bits, &bits) || !Rd(d, F.openR, &o->ratio) || !Rd(d, F.maxAng, &o->maxAng)) return false;
+    o->mat = type;
+    float k[3], h[3];
+    if (!OLUE3_DoorKnobWorld(d, k) || !OLUE3_DoorHinge(d, h)) return false;
+    o->d = d; o->knob = { k[0], k[1], k[2] }; o->hinge = { h[0], h[1], h[2] };
+    o->locked = (bits & F.mLocked) && !(F.mFake && (bits & F.mFake));
+    o->rev = F.mRev && (bits & F.mRev); o->cant = F.mCant && (bits & F.mCant);
+    if (!(o->maxAng > 5.0f && o->maxAng < 200.0f)) o->maxAng = 95.0f;
+    // the game is doing something with it: a procedural rattle / blocked / auto-close swing, an AI
+    // going through, its own open-close animation, broken
+    unsigned char st = 0, brk = 0; void* user = nullptr;
+    o->busy = (F.mBusyBits && (bits & F.mBusyBits)) ||
+              (F.dstate && Rd(d, F.dstate, &st) && (st == 3 || st == 4)) ||
+              (F.dbreak && Rd(d, F.dbreak, &brk) && brk != 0) ||
+              (F.duser && Rd(d, F.duser, &user) && user && user != OLUE3_Hero());
+    return true;
+}
+static DoorSim* SimFor(void* d, bool create) {
+    for (DoorSim& s : s_sim) if (s.d == d) return &s;
+    if (!create) return nullptr;
+    for (DoorSim& s : s_sim) if (!s.live) { s = {}; s.d = d; return &s; }
+    return nullptr;
+}
+static bool ClimbHolding(int h);   // [CLIMB] below: a hand that holds an edge is not a door hand
+static float BodyYaw();             //  [DOORLETGO] below
+static bool CamInRightHand();
+static void Doors(ULONGLONG now, float dt, V3 handW[2], bool handOk[2], const OLXrFrameHands& fh) {
+    // [LOCKED] the second of the two quick buzzes when a locked door is squeezed.
+    for (int h = 0; h < 2; ++h) if (s_lockedPulseAt[h] && now >= s_lockedPulseAt[h]) {
+        s_lockedPulseAt[h] = 0;
+        OLXR_HapticPulse(h, 0.9f, 90);
+    }
+    s_doorAnchorOn[0] = s_doorAnchorOn[1] = false;
+    if (!g_on[ON_DOORS]) {
+        s_grab[0].d = s_grab[1].d = nullptr; s_nearN = 0; s_nearKnob[0] = s_nearKnob[1] = false;
+        s_nearDoorWide[0] = s_nearDoorWide[1] = false;
+        s_anchorLock[0] = s_anchorLock[1] = false; s_grabFixed[0] = s_grabFixed[1] = false;
+        for (DoorSim& s : s_sim) { s.live = false; s.autoRun = false; }
+        return;
+    }
+    // [DOOR] the closing sound is cut after its start (its latch end is harsh); do this for every sim,
+    // even one that has already come to rest, so the harsh tail never plays.
+    for (DoorSim& s : s_sim) {
+        if (s.sndCloseCut && now >= s.sndCloseCut) {
+            s.sndCloseCut = 0;
+            OLSound_StopByName(DoorSoundName(s.sndMat), 0);
+        }
+    }
+    if (now - s_allMs > 2000) { s_allN = OLUE3_ObjectsOfClass("OLDoor", s_all, 512); s_allMs = now; }
+    if (s_allN > 0) OLUE3_DoorEventHook(s_all[0]);                       // (Test43) [DOOREVENT] once, from a door's vtable
+    // Doors within 4 m, nearest knob first.
+    NearDoor cand[32]; int nc = 0;
+    for (int i = 0; i < s_allN && nc < 32; ++i) {
+        V3 l;
+        if (!Rd(s_all[i], F.loc, &l)) continue;
+        const float dx = l.x - s_headW.x, dy = l.y - s_headW.y, dz = l.z - s_headW.z;
+        if (sqrtf(dx * dx + dy * dy) > 400.0f || fabsf(dz) > 300.0f) continue;
+        if (!ReadDoor(s_all[i], &cand[nc])) continue;
+        cand[nc].dist = Len(Sub(cand[nc].knob, s_headW));
+        ++nc;
+    }
+    for (int i = 1; i < nc; ++i) {   // insertion sort, nc <= 32
+        NearDoor t = cand[i]; int j = i - 1;
+        while (j >= 0 && cand[j].dist > t.dist) { cand[j + 1] = cand[j]; --j; }
+        cand[j + 1] = t;
+    }
+    s_nearN = nc < 12 ? nc : 12;
+    for (int i = 0; i < s_nearN; ++i) s_near[i] = cand[i];
+    {   // [DEVBRIDGE] "doorev": one event at the nearest door
+        const long t = InterlockedExchange(&s_devDoorEv, -1);
+        if (t >= 0 && s_nearN > 0) ILog("[OLVR][DOOREVENT] (dev) event %ld at the nearest door: %s", t, OLUE3_DoorTriggerEvent(s_near[0].d, (int)t) ? "fired" : "FAILED");
+    }
+    // a sim whose door left the list (out of range, gone) stops
+    for (DoorSim& s : s_sim) {
+        if (!s.live) continue;
+        bool there = false;
+        for (int i = 0; i < s_nearN; ++i) if (s_near[i].d == s.d) there = true;
+        if (!there) s.live = false;
+    }
+    V3 hero = { 0, 0, 0 }; const bool heroOk = Rd(OLUE3_Hero(), F.loc, &hero);
+    int dlm = 0, dsm = 0; OLUE3_HeroMoveState(&dlm, &dsm);
+    const bool heroDoorMove = (dlm == 2 && dsm >= 28 && dsm <= 36) || dlm == 7;   // (Test43) his own door moves (X)
+    // [DOORGUARD] THE HANDS-ON DOORS MUST NOT TOUCH A DOOR THE PLAYER IS INSIDE.
+    // The world is full of OLDoor actors that are not doors to walk through: a locker IS one (moveMode 8,
+    // SpecialMove 38/39), a bed, a squeeze. They have a hinge and a knob, so the proximity scan picked them
+    // up and the open-hand collision / handle code wrote TargetOpenRatio on the very locker the player was
+    // standing in: "the locker opened by itself" and "the locker door went invisible for a moment". While
+    // Miles is in any special move (locker, bed, squeeze, ladder, ledge, cinematic) the hands-on door layer
+    // stands down completely - the game owns that geometry.
+    const bool heroSpecialMove = dlm != 0 && dlm != 7;
+    // ---- the hands: who holds which handle, who could squeeze one -------------------------------------
+    int best[2] = { -1, -1 }; float bestD[2] = { 1e9f, 1e9f };
+    for (int h = 0; h < 2; ++h) {
+        s_nearKnob[h] = false;
+        Grab& g = s_grab[h];
+        // [DOOR] light buzz while a hand holds a knob
+        if (s_grabFixed[h] && now > s_grabHapUntil[h]) { s_grabHapUntil[h] = now + 350; OLXR_HapticPulse(h, 0.25f, 15); }
+        if (!handOk[h] || ClimbHolding(h) || (h == 1 && (CamInRightHand() || g_camButton || OLInteract_FaceCamPinned()))) {
+            s_grabFixed[h] = false; s_anchorLock[h] = false; g.d = nullptr;
+            s_nearDoorWide[h] = false;
+            continue;
+        }
+        for (int i = 0; i < s_nearN; ++i) {
+            const float d = Len(Sub(handW[h], s_near[i].knob));
+            if (d < bestD[h]) { bestD[h] = d; best[h] = i; }
+        }
+        s_nearKnob[h] = best[h] >= 0 && bestD[h] < kGrabUU;
+        s_nearDoorWide[h] = best[h] >= 0 && bestD[h] < kDoorWideUU;
+        if (g.d) {
+            const NearDoor* nd = nullptr;
+            for (int i = 0; i < s_nearN; ++i) if (s_near[i].d == g.d) nd = &s_near[i];
+            // [DOORLETGO] how far the body has turned since it took hold, and where the knob sits from the head
+            float turned = (BodyYaw() - g.yaw) * 57.2957795f;
+            while (turned > 180.0f) turned -= 360.0f;
+            while (turned < -180.0f) turned += 360.0f;
+            float reach = 0.0f;
+            if (nd) {
+                const float kx = nd->knob.x - s_headW.x, ky = nd->knob.y - s_headW.y;
+                reach = sqrtf(kx * kx + ky * ky);
+            }
+            // the grip lets go only after a real turn / walk off, not on the small hand movements that are
+            // just moving the door.
+            const float dx = handW[h].x - s_grabFixPt[h].x, dy = handW[h].y - s_grabFixPt[h].y;
+            const float sNow = dx * s_grabTan[h].x + dy * s_grabTan[h].y;
+            const bool turnedAway = fabsf(turned) > kLetGoTurnDeg;
+            const bool outOfReach = reach > kLetGoReachUU;
+            //  PULLING THE HAND AWAY NO LONGER DROPS THE HANDLE.
+            // `travel` is how far the CONTROLLER has moved from the grab point, and the removed check
+            // ("pulled away from the handle", past 60 cm of hand travel) let go of the knob - so while
+            // squeezing, the hand could be dragged off the knob and the door was left behind. A real hand
+            // on a handle cannot do that: the handle comes with it. The knob is now held for as long as
+            // the grip is closed, and the hand's travel drives the door through the handle gain (already
+            // capped by kMaxArmReachUU), so the hand rides the knob. A genuine let-go is still the grip
+            // opening, the door going away / being taken by the game, the body turning away, or the knob
+            // ending up out of the arm's reach.
+            if (!s_gripDown[h] || !nd || nd->busy || turnedAway || outOfReach) {
+                ILog("[OLVR][DOORPHYS] handle let go by the %s hand (%s) at ratio %.2f", h ? "right" : "left",
+                     !s_gripDown[h] ? "grip open" : (!nd ? "door gone" : (nd->busy ? "the game took the door" :
+                     (turnedAway ? "the body turned away" : "out of reach"))),
+                     nd ? nd->ratio : -1.0f);
+                // [DOOR] auto-finish on let-go: an open door released while still opening finishes opening;
+                // an open door the hand clearly pushed toward closing is closed on its own. Anything below
+                // the opening threshold just stays where it was - releasing a half-open door never slams it.
+                if (nd) {
+                    DoorSim* ds = SimFor(nd->d, true);
+                    if (ds) {
+                        bool act = false;
+                        if (nd->ratio > kAutoOpenRatio && sNow > -kAutoCloseMove * 0.5f) { ds->autoTo = 1.0f; act = true; }
+                        else if (nd->ratio > 0.20f && sNow < -kAutoCloseMove) { ds->autoTo = 0.0f; act = true; }
+                        if (act) {
+                            ds->live = true; ds->autoRun = true; ds->om = (ds->autoTo > 0.5f ? kOpenSwing : -kOpenSwing);
+                            ds->sndDir = 0; ds->sndFrom = nd->ratio; ds->sndBlockUntil = 0; ds->sndCloseCut = 0;
+                            ds->lastCmd = nd->ratio; ds->startR = nd->ratio;
+                            ds->sndOpened = ds->sndClosed = false;   // let the finish play its sound
+                            // [DOOR] sound is posted from the movement branch below (material-aware),
+                            // so it is not repeated here.
+                            ILog("[OLVR][DOORPHYS] auto-finish door at ratio %.2f (hand travel %+.0f uu) -> %s",
+                                 nd->ratio, sNow, ds->autoTo > 0.5f ? "opening" : "closing");
+                        }
+                    }
+                }
+                OLXR_HapticPulse(h, 0.3f, 25);
+                s_grabFixed[h] = false; s_anchorLock[h] = false; s_grabS[h] = s_grabSPrev[h] = 0.0f;
+                s_doorAnchorFixed[h] = false; s_doorAnchorOn[h] = false;   // release anchor so next grab re-aligns
+                s_doorLetGoKnob[h] = true;   // drop it now: no half-second of the hand staying on the handle
+                s_pushSuppressUntil[h] = now + kPushSuppressMs;   // let the door swing through this hand for a moment
+                g.d = nullptr;
+            }
+            continue;
+        }
+        if (!s_gripEdge[h] || best[h] < 0 || bestD[h] >= kGrabUU) continue;
+                                             // the left hand holds a battery
+        const NearDoor& nd = s_near[best[h]];
+        if (nd.locked) {
+            s_lockedFlashUntil = now + 900; s_lockedDoor = nd.d;
+            OLXR_HapticPulse(h, 0.9f, 90);
+            s_lockedPulseAt[h] = now + 170;   // second quick buzz, one after the other
+            ILog("[OLVR][INTERACT] door knob grabbed by the %s hand - LOCKED", h ? "right" : "left");
+            continue;
+        }
+        if (nd.busy) continue;
+        g.d = nd.d; g.lastR = nd.ratio; g.yaw = BodyYaw();
+        // [DOOR] pin Miles's hand at a fixed world point on the knob so it never wanders into the door
+        // or between two knobs; small wiggles are masked by the deadzone in the handle spring below.
+        const float phi0 = atan2f(nd.knob.y - nd.hinge.y, nd.knob.x - nd.hinge.x);
+        const float sign = nd.rev ? 1.0f : -1.0f;
+        s_grabFixPt[h] = handW[h];
+        s_grabTan[h] = { sign * -sinf(phi0), sign * cosf(phi0), 0.0f };
+        s_grabA0[h] = nd.ratio * nd.maxAng;
+        s_grabS[h] = s_grabSPrev[h] = 0.0f;
+        // [DOOR] center point of the knob at grab time: the hand is guided to this fixed spot on the
+        // handle so it always ends up at the same correct position, whatever angle the controller was
+        // held at when the grab happened.
+        s_grabKnobCenter[h] = nd.knob;
+        // which face of the door the palm is on: keep Miles's hand on that face's handle for the whole
+        // grab, so the hand always ends up at the same correct spot on the knob - never inside the door
+        // or between the two knobs (a door has one handle on each face). The side is fixed at grab time
+        // and never revisited while the door swings, so a small hand wiggle cannot flip the hand to the
+        // other face. The game's knob sits on one face; the other face's handle is its mirror (kHandleFaceUU).
+        // Decided from the HAND's position at grab time, relative to the panel normal.
+        const float nx = -sinf(phi0), ny = cosf(phi0);
+        const float side = (handW[h].x - nd.hinge.x) * nx + (handW[h].y - nd.hinge.y) * ny;
+        s_grabSide[h] = side < 0.0f ? -1 : 1;
+        s_anchorYaw[h] = 0.0f; s_anchorLock[h] = true; s_grabFixed[h] = true;
+        s_grabHapUntil[h] = now + 250;   // buzz while holding the knob
+        //  snap the anchor weight to 1 instantly so the hand magnet pulls
+        // onto the handle immediately instead of easing in over several frames.
+        s_anchorWt[h] = 1.0f;
+        DoorSim* ds = SimFor(nd.d, false);
+        if (ds) { ds->autoRun = false; ds->sndOpened = ds->sndClosed = false; ds->sndDir = 0; ds->sndFrom = nd.ratio; ds->sndBlockUntil = now; }
+        OLXR_HapticPulse(h, 0.5f, 40);
+        Learn(LN_DOOR);
+        ILog("[OLVR][DOORPHYS] handle grabbed by the %s hand (%.0f uu off) - ratio %.2f, max %.0f deg%s%s",
+             h ? "right" : "left", bestD[h], nd.ratio, nd.maxAng, nd.rev ? ", reversed" : "", nd.cant ? ", can't close" : "");
+    }
+    // ---- each door a hand touches (or that is still swinging) ----------------------------------------
+    for (int i = 0; i < s_nearN; ++i) {
+        const NearDoor& nd = s_near[i];
+        if (heroSpecialMove) {
+            // [DOORGUARD] a locker / bed / squeeze / ladder / ledge / cinematic: the game owns every door
+            // near him. Drop the sims and any grab instead of pushing the geometry he is standing in.
+            DoorSim* hs = SimFor(nd.d, false);
+            if (hs) { hs->live = false; hs->om = 0.0f; hs->autoRun = false; hs->gameUntil = now + 2000; }
+            for (int h = 0; h < 2; ++h) {
+                if (s_grab[h].d == nd.d) { s_grab[h].d = nullptr; s_grabFixed[h] = false; s_anchorLock[h] = false; }
+                if (s_pushDoor[h] == nd.d) { s_pushDoor[h] = nullptr; s_pushSide[h] = 0; }
+            }
+            continue;
+        }
+        if (heroDoorMove) {
+            // (Test43) Miles is opening / closing a door the game's way (X: its door moves 28-36, or the door
+            // locomotion): every door near him is the game's until 2 s after - a hand in the swing of a door
+            // X opened pushed it back shut
+            DoorSim* hs = SimFor(nd.d, nd.dist < 300.0f);
+            if (hs) { hs->live = false; hs->gameUntil = now + 2000; }
+            for (int h = 0; h < 2; ++h) {
+                if (s_grab[h].d == nd.d) { s_grab[h].d = nullptr; s_grabFixed[h] = false; s_anchorLock[h] = false; }
+                if (s_pushDoor[h] == nd.d) { s_pushDoor[h] = nullptr; s_pushSide[h] = 0; }
+            }
+            continue;
+        }
+        const float ex = nd.knob.x - nd.hinge.x, ey = nd.knob.y - nd.hinge.y;
+        const float width = sqrtf(ex * ex + ey * ey) + 8.0f;
+        const float phi0 = atan2f(ey, ex) * 57.2957795f;               // the panel, hinge -> knob (deg)
+        const float sign = nd.rev ? 1.0f : -1.0f;                      // panel angle per ratio (0xCB2300)
+        // open hands against this panel: which side, how far in
+        bool contact[2] = { false, false }; float aC[2] = { 0, 0 }, dirA[2] = { 0, 0 };
+        for (int h = 0; h < 2; ++h) {
+            if (!handOk[h] || s_gripDown[h] || ClimbHolding(h) || (h == 1 && (CamInRightHand() || g_camButton))) {
+                if (s_pushDoor[h] == nd.d) { s_pushDoor[h] = nullptr; s_pushSide[h] = 0; }
+                continue;
+            }
+            const float hx = handW[h].x - nd.hinge.x, hy = handW[h].y - nd.hinge.y;
+            const float r = sqrtf(hx * hx + hy * hy);
+            const bool inBand = r >= 10.0f && r <= width && handW[h].z > nd.knob.z - 95.0f && handW[h].z < nd.knob.z + 120.0f;
+            const float aHand = atan2f(hy, hx) * 57.2957795f, d = Wrap180(aHand - phi0);
+            // [DOORDEBUG] detailed hand-vs-panel info when hand is near a door panel
+            static ULONGLONG s_doorLogMs[2] = { 0, 0 };
+            if (now - s_doorLogMs[h] > 500) {
+                s_doorLogMs[h] = now;
+                const bool isGrabbing = s_grab[h].d != nullptr;
+                const float perp = r * sinf(d * 0.0174532925f);
+                ILog("[OLVR][DOORDEBUG] hand %d: inBand=%d grabbing=%d contact=%d "
+                     "handW=(%.0f %.0f %.0f) knobW=(%.0f %.0f %.0f) hingeW=(%.0f %.0f %.0f) "
+                     "r=%.0f phi0=%.0f aHand=%.0f d=%.0f perp=%.0f ratio=%.2f maxA=%.0f",
+                     h, inBand ? 1 : 0, isGrabbing ? 1 : 0, contact[h] ? 1 : 0,
+                     handW[h].x, handW[h].y, handW[h].z,
+                     nd.knob.x, nd.knob.y, nd.knob.z,
+                     nd.hinge.x, nd.hinge.y, nd.hinge.z,
+                     r, phi0, aHand, d, perp,
+                     nd.ratio, nd.maxAng);
+            }
+            if (!inBand || fabsf(d) > 60.0f) {                         // not at this panel
+                if (s_pushDoor[h] == nd.d) { s_pushDoor[h] = nullptr; s_pushSide[h] = 0; }
+                continue;
+            }
+            const float perp = r * sinf(d * 0.0174532925f);
+            int sd = (s_pushDoor[h] == nd.d) ? s_pushSide[h] : 0;
+            // the side is decided once, clearly on one side - a fast shove that outruns the panel
+            // must not end up "on the other side" and pull the door back as the hand comes home
+            if (sd == 0 && fabsf(perp) > g_contactUU + 2.0f) sd = perp > 0 ? 1 : -1;
+            s_pushDoor[h] = nd.d; s_pushSide[h] = sd;
+            if (sd == 0 || perp * sd > g_contactUU + 0.5f) continue;     // not touching (or no side yet)
+            // the panel angle (in "ratio degrees") where it just touches this hand on its side, and which
+            // way is toward the hand: the panel may not pass that angle toward the hand
+            const float s = g_contactUU / r < 1.0f ? g_contactUU / r : 1.0f;
+            const float aTouch = aHand - sd * asinf(s) * 57.2957795f;
+            contact[h] = true;
+            aC[h] = nd.ratio * nd.maxAng + sign * Wrap180(aTouch - phi0);
+            dirA[h] = sign * (float)sd;
+            // [DOOR] open-hand collision box: check if the whole hand (wrist + fingertips) is crossing
+            // the door panel. If so, keep contact active so the hand is pushed back out.
+            if (handOk[h] && !s_gripDown[h] && !s_grab[h].d) {
+                // hand direction: grip pose has fingers pointing along -Z; rotate by controller quaternion
+                const OLXrPose& hp = fh.hand[h];
+                const float qx = hp.qx, qy = hp.qy, qz = hp.qz, qw = hp.qw;
+                // rotate (0,0,-1) by quaternion -> finger direction in tracking space
+                const float fx = 2.0f * (qx*qz - qw*qy);
+                const float fy = 2.0f * (qy*qz + qw*qx);
+                const float fz = 1.0f - 2.0f * (qx*qx + qy*qy);
+                // apply yaw rotation (same as TrackToWorld) to get world direction
+                const float dirX =  s_cy * fx - s_sy * fz;
+                const float dirZ =  s_sy * fx + s_cy * fz;
+                const float fingerTipX = handW[h].x + dirX * kFingerLenUU;
+                const float fingerTipY = handW[h].y + dirZ * kFingerLenUU;
+                const float fingerTipZ = handW[h].z;
+                // box center: midpoint between wrist and fingertips
+                const float boxCX = (handW[h].x + fingerTipX) * 0.5f;
+                const float boxCY = (handW[h].y + fingerTipY) * 0.5f;
+                const float boxCZ = (handW[h].z + fingerTipZ) * 0.5f;
+                // panel normal (points toward the player's side)
+                const float nx = -sinf(phi0 * 0.0174532925f);
+                const float ny =  cosf(phi0 * 0.0174532925f);
+                // signed distance of box center to panel plane
+                const float dCenter = nx * (boxCX - nd.hinge.x) + ny * (boxCY - nd.hinge.y);
+                // box radius along normal: half-width + half-length * |cos(angle between hand dir and normal)|
+                const float dirDotNormal = nx * dirX + ny * dirZ;
+                const float boxRadius = kHandWidthUU + (kFingerLenUU * 0.5f) * fabsf(dirDotNormal);
+                //  PRONATED HAND (palm down): the fingers lie ACROSS the panel, not toward
+                // it, so |dir . normal| is near zero and the old radius collapsed to the hand's half
+                // width - the fingers then went straight through the door. The box has to account for
+                // the hand's extent in the direction it is actually lying, which is the component of
+                // the finger span PERPENDICULAR to the normal: a flat hand is at its widest against
+                // the panel. The extra term is exactly that, so a palm-down hand is now caught by its
+                // fingers instead of being (wrongly) treated as a thin edge.
+                const float acrossNormal = sqrtf(fmaxf(0.0f, 1.0f - dirDotNormal * dirDotNormal));
+                const float edgeRadius = kHandWidthUU + (kFingerLenUU * 0.5f) * acrossNormal;
+                if (fabsf(dCenter) < (boxRadius > edgeRadius ? boxRadius : edgeRadius)) {
+                    contact[h] = true;
+                }
+            }
+        }
+        int ng = 0; int gh[2];
+        for (int h = 0; h < 2; ++h) if (s_grab[h].d == nd.d) gh[ng++] = h;
+        DoorSim* s = SimFor(nd.d, false);
+        if (!ng && !contact[0] && !contact[1] && !(s && s->live)) continue;
+        if (nd.locked) {
+            if ((contact[0] || contact[1]) && now - s_pushLockedMs > 1500) {
+                s_pushLockedMs = now; s_lockedFlashUntil = now + 900; s_lockedDoor = nd.d;
+                OLXR_HapticPulse(contact[1] ? 1 : 0, 0.7f, 60);
+                ILog("[OLVR][DOORPUSH] pushed a LOCKED door with the %s hand", contact[1] ? "right" : "left");
+            }
+            if (s) s->live = false;
+            continue;
+        }
+        if (nd.busy) { if (s && s->live) { s->live = false; ILog("[OLVR][DOORPHYS] the game took a door back (its own swing / an AI / a script)"); } continue; }
+        // (Test43) Miles is opening / closing a door the game's way (X: its door moves 28-36, or the door
+        // locomotion): every door is the game's until he is done - a hand in the swing pushed one back shut
+        if (s && !ng && now < s->gameUntil) {                          // just moved by the game: an open hand in its way waits,
+            for (int h = 0; h < 2; ++h) if (s_pushDoor[h] == nd.d) { s_pushDoor[h] = nullptr; s_pushSide[h] = 0; }   // and finds its side afresh
+            continue;
+        }
+        if (!s) s = SimFor(nd.d, true);
+        if (!s) continue;
+        if (s->live && !ng && !contact[0] && !contact[1] && !s->autoRun && fabsf(nd.ratio - s->lastCmd) > 0.06f) {
+            // somebody else moved it (X, a script): it is the game's until it is touched again. While a
+            // hand is on it we keep it: the game's own auto-close must not pull it shut under the hand.
+            ILog("[OLVR][DOORPHYS] door moved by the game (%.2f, we left it at %.2f) - handing it back", nd.ratio, s->lastCmd);
+            s->live = false; s->om = 0.0f; s->autoRun = false; s->gameUntil = now + 1500;
+            for (int h = 0; h < 2; ++h) if (s_grab[h].d == nd.d) { s_grab[h].d = nullptr; s_grabFixed[h] = false; s_anchorLock[h] = false; }
+            continue;
+        }
+        if (!s->live) { s->live = true; s->om = 0.0f; s->lastCmd = nd.ratio; s->lastHapR = nd.ratio; s->pushed = false; s->startR = nd.ratio; s->evOpen = false; s->autoRun = false; s->sndOpened = s->sndClosed = false; s->sndDir = 0; s->sndFrom = nd.ratio; s->sndBlockUntil = 0; s->sndCloseCut = 0; }
+        const float maxA = nd.maxAng, A = nd.ratio * maxA;
+        const float lo = nd.cant ? A : 0.0f, hi = (nd.ratio > 1.0f ? nd.ratio : 1.0f) * maxA;
+        float Om = s->om;
+        // the handle: the hand's linear travel along the knob's opening tangent is scaled into door degrees
+        if (ng) {
+            float alpha = 0.0f;
+            for (int k = 0; k < ng; ++k) {
+                const int h = gh[k];
+                const float dx = handW[h].x - s_grabFixPt[h].x, dy = handW[h].y - s_grabFixPt[h].y;
+                float sTravel = dx * s_grabTan[h].x + dy * s_grabTan[h].y;
+                if (fabsf(sTravel) <= kGrabDeadzone) sTravel = 0.0f;
+                else sTravel -= (sTravel > 0.0f ? kGrabDeadzone : -kGrabDeadzone);
+                // [DOOR] arm fully extended: once the hand is beyond kMaxArmReachUU from the grab
+                // point the door stops following it (the arm can't reach further).
+                const bool armExtended = fabsf(sTravel) > kMaxArmReachUU;
+                const float vTravel = (sTravel - s_grabSPrev[h]) / dt;
+                s_grabS[h] = sTravel; s_grabSPrev[h] = sTravel;
+                float target = s_grabA0[h] + kHandleGain * sTravel;
+                if (target < lo) target = lo; if (target > hi) target = hi;
+                if (!armExtended) {
+                    alpha += kHandleK * (target - A) - kHandleC * Om + kHandleVelGain * vTravel;
+                }
+            }
+            alpha /= (float)ng;
+            if (alpha > 2500.0f) alpha = 2500.0f; if (alpha < -2500.0f) alpha = -2500.0f;
+            Om += alpha * dt;
+            if (Om > kHandleMaxOm) Om = kHandleMaxOm; if (Om < -kHandleMaxOm) Om = -kHandleMaxOm;
+        } else if (s->autoRun) {
+            // a door released past the opening threshold finishes on its own; one pushed toward closing
+            // while open closes on its own. It drives all the way instead of coasting to a stop.
+            const float want = s->autoTo * maxA;
+            const float diff = want - A;
+            if (fabsf(diff) < 0.75f) { Om = 0.0f; s->autoRun = false; }
+            else Om = (diff > 0.0f ? 1.0f : -1.0f) * kOpenSwing;
+        } else {   // hinge friction
+            const float dec = kFricCoul * dt;
+            Om = fabsf(Om) <= dec ? 0.0f : Om - (Om > 0.0f ? dec : -dec);
+            Om *= expf(-kFricVisc * dt);
+        }
+        float An = A + Om * dt;
+        // pushing hands: an open hand pushes the panel, but a hand that just let go of a held door is
+        // suppressed for a moment (kPushSuppressMs) so the door can swing through it and finish its
+        // travel instead of being stopped right after release. While one hand is swinging the door on
+        // the handle, the other (open) hand does not block it either: the door passes through it too.
+        bool anyPush = false;
+        for (int h = 0; h < 2; ++h) {
+            if (!contact[h] || now < s_pushSuppressUntil[h]) continue;
+            if (ng > 0 || s->autoRun) continue;                        // a hand (or the finish) is driving it
+            anyPush = true;
+            const float need = (aC[h] - A) / dt, maxDv = kPushAccel * dt;
+            float dv = need - Om; if (dv > maxDv) dv = maxDv; if (dv < -maxDv) dv = -maxDv;
+            if (dirA[h] * dv < 0.0f) Om += dv;                         // push the door away from the hand
+            An = A + Om * dt;
+        }
+        if (anyPush) { s->pushed = true; s->autoRun = false; }
+        else if (s->pushed) s->pushed = false;
+        // stops: open (a soft bounce), closed (it latches), can't-close doors stay where they are
+        if (An > hi) {
+            An = hi;
+            const bool justOpened = Om > 0.0f;
+            if (justOpened) { if (Om > 60.0f) for (int h = 0; h < 2; ++h) if (contact[h] || s_grab[h].d == nd.d) OLXR_HapticPulse(h, 0.35f, 30); Om = -0.25f * Om; }
+        }
+        if (An < lo) {
+            An = lo;
+            if (Om < 0.0f) {
+                if (Om < -60.0f) {
+                    ILog("[OLVR][DOORPHYS] the door swung shut (%.0f deg/s)", -Om);
+                    for (int h = 0; h < 2; ++h) if (handOk[h] && Len(Sub(handW[h], nd.knob)) < 80.0f) OLXR_HapticPulse(h, 0.6f, 45);
+                }
+                Om = 0.0f;
+            }
+        }
+        // [DOOR] movement sound: a material-aware event (EV_Opening_Wood/Metal/Security_Door) plays
+        // once per direction. Evaluated every frame while the door moves (not just on the transition),
+        // because on the first moving frame the door has not travelled far enough yet. A sound needs
+        // 15% of travel since the last one, so a bounce near the end cannot retrigger.
+        {
+            const float sndRatio = An / maxA;
+            const int st = (fabsf(Om) <= kSndSpeed) ? 0 : (Om > 0.0f ? 1 : 2);
+            if (st != 0) {
+                const bool wantOpen = (st == 1 && !s->sndOpened);
+                const bool wantClose = (st == 2 && !s->sndClosed);
+                const bool moved = fabsf(sndRatio - s->sndFrom) > 0.15f;
+                if ((wantOpen || wantClose) && moved && now >= s->sndBlockUntil) {
+                    const int mi = (nd.mat <= 2) ? nd.mat : 0;
+                    int cn = 0;
+                    const char* const* cand = DoorSoundCandidates((unsigned char)mi, &cn);
+                    if (OLSound_Ready()) OLSound_PostFirstOf(cand, cn, 0);
+                    else {   // [DOOR] the Wwise hooks are what make any of this audible: say so, once
+                        static bool s_noSnd = false;
+                        if (!s_noSnd) { s_noSnd = true; ILog("[OLVR][DOOR] the door movement sound cannot play - the Wwise hooks are not ready (see [OLVR][SOUND] in the log)"); }
+                    }
+                    s->sndMat = (unsigned char)mi;
+                    s->sndBlockUntil = now + kSndBlockMs;
+                    s->sndFrom = sndRatio;
+                    if (st == 1) { s->sndOpened = true; s->sndClosed = false; }
+                    else { s->sndClosed = true; s->sndOpened = false; }
+                    s->sndCloseCut = now + kSndCloseCutMs;   // fade the tail out on both open and close
+                }
+            }
+            s->sndDir = st;
+        }
+
+        // [DOOR] open hands are left to the controller (the door passes through them); the palm is
+        // turned toward the door by ol_ue3 while pushing.
+        // Miles: the panel now passes through him in both directions - opening *and* closing - so the
+        // door never bounces back on Miles when you try to open or close it.
+        (void)heroOk; (void)hero;
+        const float tn = An / maxA;
+        // [DOOREVENT] (Test43) a door the hands open from shut tells the game, as its own opening does
+        unsigned char dst = 0xFF;
+        if (!s->evOpen && (ng) && s->startR < 0.05f && tn > s->startR + 0.03f) {
+            s->evOpen = true;
+            if (F.dstate && Rd(nd.d, F.dstate, &dst) && dst != 3 && dst != 4) {
+                int fired = 0;
+                if (dst == 0) fired += OLUE3_DoorTriggerEvent(nd.d, 0);
+                WrB(nd.d, F.dstate, 1);
+                fired += OLUE3_DoorTriggerEvent(nd.d, 1);
+                ILog("[OLVR][DOOREVENT] the hands opened a door (state %u -> 1): %s", (unsigned)dst, fired ? "the game's open events fired" : "events FAILED");
+            }
+        }
+        // ... and one they swing shut, as its own closing does
+        if (tn <= 0.0005f && nd.ratio > 0.01f && (ng || fabsf(Om) > 1.0f || s->om != 0.0f) &&
+            F.dstate && Rd(nd.d, F.dstate, &dst) && (dst == 1 || dst == 2)) {
+            OLUE3_DoorTriggerEvent(nd.d, 2);
+            WrB(nd.d, F.dstate, 0);
+            s->evOpen = false; s->startR = 0.0f;
+            ILog("[OLVR][DOOREVENT] the hands shut a door: the game's close event fired, state -> 0");
+        }
+        if (fabsf(tn - nd.ratio) > 1e-5f) {
+            if (!OLUE3_DoorSetRatioAndTarget(nd.d, tn)) WrF(nd.d, F.tgtR, tn);
+            if (fabsf(tn - s->lastHapR) > 0.025f) {                     // the hinge "creak"
+                for (int k = 0; k < ng; ++k) OLXR_HapticPulse(gh[k], 0.12f, 18);
+                s->lastHapR = tn;
+                if (ng) Learn(LN_DOOR);
+            }
+            static ULONGLONG s_logMs = 0;
+            if ((ng) && now - s_logMs > 1500) {
+                s_logMs = now;
+                ILog("[OLVR][DOORPHYS] %s: ratio %.2f -> %.2f at %.0f deg/s", ng ? "handle" : "push", nd.ratio, tn, Om);
+            }
+        }
+        s->lastCmd = tn; s->om = Om; s->ms = now;
+        // [DOOR] magnet: Miles's hand is anchored to the knob of the face he grabbed, so it is pulled to
+        // the correct spot on the handle and follows the door as it swings. This keeps the hand from
+        // drifting away or ending up inside the door / between two knobs when you walk around.
+        for (int k = 0; k < ng; ++k) {
+            const int h = gh[k];
+            const float da = sign * (An - A) * 0.0174532925f, c = cosf(da), sn = sinf(da);
+            const float kx = nd.knob.x - nd.hinge.x, ky = nd.knob.y - nd.hinge.y;
+            const float nkx = kx * c - ky * sn, nky = kx * sn + ky * c;      // the knob after this swing
+            const float phiN = phi0 * 0.0174532925f + da;
+            const float px = -sinf(phiN), py = cosf(phiN);                   // the panel's normal
+            const float dNative = nkx * px + nky * py;                       // how far the game's knob sits off the panel
+            const int nativeSide = dNative > 1.0f ? 1 : (dNative < -1.0f ? -1 : 0);
+            float off = fabsf(dNative);
+            if (nativeSide == 0) off = kHandleFaceUU;                        // knob on the panel plane: use the door depth
+            else if (s_grabSide[h] != nativeSide) off += kHandleFaceUU;      // the handle on the other face
+            //  NEVER PUT THE WRIST INSIDE THE PANEL.
+            // `off` is how far the game's knob itself stands off the face. On a nearly flush
+            // handle that is ~6 uu - thinner than a hand - so the palm sank a little way into
+            // the door ("the hand goes forward and ends up inside it"). The anchor is held at
+            // least as far out as an open hand is (the same g_pushDepthUU the collision uses),
+            // so the hand sits ON the handle, not in the panel.
+            if (off < g_pushDepthUU) off = g_pushDepthUU;
+            const float ipx = nd.hinge.x + nkx - px * dNative;               // the knob projected onto the panel
+            const float ipy = nd.hinge.y + nky - py * dNative;
+            //  RESTORED to the shipped behaviour: the anchor is the knob point on the
+            // grabbed face, at the height the hand had when it grabbed. The "knob's own Z" version
+            // moved the hand off the handle for this game's doors, and the live trim did not catch it.
+            //  guide the hand a little lower on the knob so the palm sits naturally on
+            // the handle instead of being pulled up onto the top of it.
+            // [DOOR] the hand is guided a little BELOW the knob centre so the palm sits on the handle
+            // instead of being pulled up onto the top of it. -5 uu was too low ("it pulls too much toward
+            // the bottom of the knob"), so the guide is only 2 uu under the centre - the palm covers the
+            // knob, the grip tips sit either side of it.
+            s_doorAnchor[h] = { ipx + px * s_grabSide[h] * off,
+                                ipy + py * s_grabSide[h] * off,
+                                s_grabKnobCenter[h].z - kHandleGuideDownUU };
+            if (!s_doorAnchorFixed[h]) {
+                s_doorAnchorFixed[h] = true;
+                s_doorAnchorMs[h] = now;   // align for ~300 ms, then release so the door passes through the hand
+            }
+            s_doorAnchorOn[h] = true;
+            s_anchorYaw[h] = sign * (An - s_grabA0[h]);   // total swing since the grab: the wrist turns with the door
+        }
+        // [DOOR] open-hand collision: keep an open hand pushing the panel from sinking through it.
+        // Anchor the wrist g_pushDepthUU in front of the panel on the player's side.
+        //  RESTORED to the shipped shape, which is what actually works: while a hand is
+        // in contact this writes the hand's anchor out from the panel, on the hand's side, and the arm
+        // solver follows the anchor. It is immediate - the same frame the contact is seen - so the
+        // hand is pushed out before it is through, and the push solver (which also reads `contact`)
+        // drives the door. The geometric variant reacted a frame late, which read as "only recognised
+        // after the hand is already through".
+        for (int h = 0; h < 2; ++h) {
+            if (!contact[h] || s_grab[h].d) continue;   // only open hands pushing, not knob-holding
+            const float hx = handW[h].x - nd.hinge.x, hy = handW[h].y - nd.hinge.y;
+            const float perp = hx * (-sinf(phi0 * 0.0174532925f)) + hy * cosf(phi0 * 0.0174532925f);
+            const float t = hx * cosf(phi0 * 0.0174532925f) + hy * sinf(phi0 * 0.0174532925f);
+            if (t < 0.0f || t > width) continue;        // beyond panel edge
+            const int sd = perp < 0.0f ? -1 : 1;        // side the hand is on
+            s_doorAnchor[h] = { nd.hinge.x + cosf(phi0 * 0.0174532925f) * t - (-sinf(phi0 * 0.0174532925f)) * sd * g_pushDepthUU,
+                                nd.hinge.y + sinf(phi0 * 0.0174532925f) * t + cosf(phi0 * 0.0174532925f) * sd * g_pushDepthUU,
+                                handW[h].z };
+            s_doorAnchorOn[h] = true;
+        }
+        if (!ng && !contact[0] && !contact[1] && fabsf(Om) < 1.5f) s->live = false;   // at rest: the game's again
+    }
+}
+
+// ---- climbing (Test40: [CLIMB]) ---------------------------------------------------------------------
+// [Motion] ClimbWithHands=1. Outlast marks every edge you can climb with OLLedgeMarker chains (a marker
+// and its Next make one straight edge; its flags say climb up / hang). Squeeze a grip with your hand on
+// a marked edge and Miles's hand holds it - it stays there while your real hand moves on. With both
+// hands holding, pull down (or toward you) and the game's own climb runs: the mod presses A, exactly
+// what its button players do, so the move that fits (vault, climb up, jump and grab) is the game's
+// choice. While Miles climbs, a hand that holds on plays his own climbing arm (on the edge); a free
+// hand stays yours. Hanging from a ledge: squeeze both grips to hold on (his hands on the edge), pull
+// down to climb up, let go of both to drop (B). On a ladder each squeeze takes the rung in front of
+// that hand; pull it down and Miles climbs until your hand is back at the rung (the stick still works).
+// Reaching up at an edge above your reach and pulling makes him jump for it.
+// [Motion] ClimbWithHands=0: the old way - A climbs, the game's arms throughout.
+struct Ledge { V3 a, b; bool up; };   // up: bCanClimbUp (else hang only)
+static Ledge s_ledges[64]; static int s_ledgeN = 0;
+static void* s_lmk[1024]; static int s_lmkN = 0; static ULONGLONG s_lmkMs = 0, s_ledgeMs = 0;
+enum { CL_IDLE, CL_PULLING, CL_CLIMBING, CL_HANG, CL_LADDER };
+static const char* const kClName[] = { "on the ground", "pull sent (A)", "climbing", "hanging from a ledge", "on a ladder" };
+static int s_cl = CL_IDLE;
+static bool s_hold[2] = { false, false };       // the hand holds on: an edge, the ledge it hangs from, a rung
+static V3 s_holdW[2];                            // where (world, uu)
+static V3 s_holdN[2];                            // [edge] horizontal, from the edge toward you
+static float s_holdRefY[2] = { 0, 0 };          // [hang] the real hand's height when both took hold (m, from the head)
+static int s_ladderDriver = -1;
+static bool s_hangHeld = false, s_bothHeldPrev = false, s_pullArmed = true;
+static ULONGLONG s_clMs = 0, s_aUntil = 0, s_aFrom = 0, s_bUntil = 0, s_bothOffMs = 0;
+static float s_ladderStick = 0.0f; static bool s_ladderStickOn = false;
+// (Test40) a pull walks Miles into the edge for a moment before the A: the game only climbs what is
+// right in front of him (the first pulls in the headset made him hop 30-40 cm short of it)
+static ULONGLONG s_stepUntil = 0; static float s_stepX = 0.0f, s_stepY = 0.0f;
+static bool s_stepping = false; static int s_stepHand = 0;
+// (Test41) [CLIMBPACE] the climb plays only as fast as the holding hands pull (Boneworks-ish): its
+// animation speed follows the hands' downward speed (PaceNominal = the game's own speed, up to 1.8x),
+// so one ~45 cm pull carries the whole move; stop pulling and Miles hangs there; let go and the game
+// finishes the climb.
+static float s_paceRate = 1.0f, s_paceWritten = 1.0f, s_prevRelY[2] = { 0.0f, 0.0f };
+// (Test46) the climb under way was started by your hands (a pull sent A) - only such a climb is paced by
+// your pull. A jump or vault you press A for yourself plays at the game's speed: with a grip held (the left
+// grip is sprint) a sprint-vault was "paced" by hands that were not pulling and froze mid-vault -
+// "you cannot vault over objects".
+static bool s_climbByHands = false;
+static bool s_prevRelOk = false, s_paceGaveUp = false;
+static ULONGLONG s_pausedSince = 0;
+// (Test41) [LADDERGRAB] walking into a ladder no longer climbs it: the stick stops short of it until a
+// hand takes a rung, then Miles steps on as you pull (the game's own mount, paced by your hands).
+struct Ladder { V3 bot, top, n; };                 // n: horizontal, from the ladder to where you stand at its foot
+static Ladder s_ladders[16]; static int s_ladderN = 0;
+static void* s_lad[256]; static int s_ladN = 0; static ULONGLONG s_ladMs = 0, s_ladderMs = 0;
+static bool s_holdLadder[2] = { false, false };
+static bool s_blockOn = false; static float s_blockX = 0.0f, s_blockY = 0.0f;   // stick frame
+// The game mounts a ladder by itself from ~90 uu (measured, walking in: blocking from 90 never caught
+// it); the stick stops at 100, where a hand still reaches the rungs. (dev: "ladderblock")
+// (Test45) 0: no barrier - "you can't walk directly up close to the ladder to climb it, it's like there is a
+// barrier there". Walk up to it and take a rung, or walk into it and the game climbs it its own way.
+//  PHYSICAL keeps no walk barrier: the stick must work all the way up to the ladder so Miles can
+// reach it and start the climb (walk into it and the game mounts it, or grab a rung and your hands take over).
+// The barrier only matters for hybrid/A button, where it stays at the ini value.
+static float s_ladderBlockUU = 0.0f;
+static const float kPhysLadderBlockUU = 0.0f;
+static float LadderWalkBlock() { return (ClimbIsPhysicalLike(g_climbMode) && s_ladderBlockUU <= 0.0f) ? kPhysLadderBlockUU : s_ladderBlockUU; }
+extern "C" void OLInteract_DevLadderBlock(float uu) { s_ladderBlockUU = uu; ILog("[OLVR][LADDERGRAB] (dev) walk stops %.0f uu from a ladder", uu); }
+static ULONGLONG s_ladderTakeUntil = 0;
+static int s_lm = 0, s_sm = 0;
+//  PHYSICAL: how far his feet are under the top of the ladder he is on, in uu (999: not on one).
+// The walk stick backs him down a ladder and, this close to its top, finishes the step off onto the floor.
+static float s_climbTopUnder = 999.0f;
+static V3 s_edgeNear; static bool s_edgeNearOn = false;   // [HOWTO] the edge point a free hand is near
+static bool ClimbHolding(int h) { return g_on[ON_CLIMB] && s_hold[h]; }
+static volatile long s_fakeReq = 0;            // [DEVBRIDGE] "fakeledge [cm]": an edge 55 cm ahead, 45 cm below the eyes (or cm above them)
+static volatile float s_fakeUp = 0.0f;
+static Ledge s_fake; static ULONGLONG s_fakeUntil = 0;
+extern "C" void OLInteract_DevFakeLedge(float upCm) { s_fakeUp = upCm; InterlockedExchange(&s_fakeReq, 1); }
+static bool IsClimbSM(int sm) {
+    switch (sm) {
+    case 6: case 8: case 9: case 10: case 14: case 15: case 16: case 17: case 18: case 19:
+    case 43: case 44: case 45: case 46: case 47: case 48: return true;
+    }
+    return false;
+}
+static bool Finite3(V3 v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) && fabsf(v.x) < 1e6f && fabsf(v.y) < 1e6f && fabsf(v.z) < 1e6f; }
+static void ClearHolds() { s_hold[0] = s_hold[1] = false; s_holdLadder[0] = s_holdLadder[1] = false; s_ladderDriver = -1; s_ladderStickOn = false; s_hangHeld = false; s_bothHeldPrev = false; }
+//  crouch-to-drop is a press (edge), not a hold: s_crouchPrev remembers the previous frame
+static bool  s_crouchPrev = false;
+//  after dropping with crouch, ignore new grabs for a moment so Miles doesn't re-grab the ledge
+static ULONGLONG s_crouchCooldown = 0;
+
+static void RefreshLedges(ULONGLONG now) {
+    if (!F.lmNext) return;
+    if (now - s_lmkMs > 4000) { s_lmkN = OLUE3_ObjectsOfClass("OLLedgeMarker", s_lmk, 1024); s_lmkMs = now; }
+    if (now - s_ledgeMs < 400) return;
+    s_ledgeMs = now; s_ledgeN = 0;
+    for (int i = 0; i < s_lmkN && s_ledgeN < 64; ++i) {
+        void* m = s_lmk[i]; V3 a, b; void* nx = nullptr;
+        if (!Rd(m, F.loc, &a) || !Finite3(a) || fabsf(a.x - s_headW.x) > 600.0f || fabsf(a.y - s_headW.y) > 600.0f || fabsf(a.z - s_headW.z) > 400.0f) continue;
+        if (!Rd(m, F.lmNext, &nx) || !nx || !Rd(nx, F.loc, &b) || !Finite3(b) || Len(Sub(a, b)) > 3000.0f) continue;
+        uint32_t bits = 0;
+        if (F.lmBits && (F.mClimbUp | F.mHang) && Rd(m, F.lmBits, &bits) && !(bits & (F.mClimbUp | F.mHang))) continue;
+        uint32_t en = 0;
+        if (F.gmBits && F.mEnabled && Rd(m, F.gmBits, &en) && !(en & F.mEnabled)) continue;
+        s_ledges[s_ledgeN].a = a; s_ledges[s_ledgeN].b = b;
+        s_ledges[s_ledgeN].up = !(F.lmBits && F.mClimbUp) || (bits & F.mClimbUp) != 0; ++s_ledgeN;
+    }
+    if (now < s_fakeUntil && s_ledgeN < 64) s_ledges[s_ledgeN++] = s_fake;
+}
+struct IRot { int pitch, yaw, roll; };
+static void RefreshLadders(ULONGLONG now) {
+    if (!F.ladOther || !F.rot) return;
+    if (now - s_ladMs > 4000) { s_ladN = OLUE3_ObjectsOfClass("OLLadderMarker", s_lad, 256); s_ladMs = now; }
+    if (now - s_ladderMs < 500) return;
+    s_ladderMs = now; s_ladderN = 0;
+    for (int i = 0; i < s_ladN && s_ladderN < 16; ++i) {
+        void* m = s_lad[i]; void* o = nullptr; V3 a, b; IRot r;
+        if (!Rd(m, F.loc, &a) || !Finite3(a) || fabsf(a.x - s_headW.x) > 800.0f || fabsf(a.y - s_headW.y) > 800.0f) continue;
+        if (!Rd(m, F.ladOther, &o) || !o || !Rd(o, F.loc, &b) || !Finite3(b) || a.z >= b.z) continue;   // from its bottom marker
+        if (!Rd(m, F.rot, &r)) continue;
+        const float yaw = (float)r.yaw * (6.2831853f / 65536.0f);
+        Ladder& L = s_ladders[s_ladderN++];
+        L.bot = a; L.top = b; L.n = { cosf(yaw), sinf(yaw), 0.0f };
+    }
+}
+// The ladder Miles stands at - at its foot on its climbing side, or on the floor behind its top - and
+// the horizontal direction from him to it. -1: none.
+static int LadderAt(V3 hero, V3* toward, bool* atTop, float* dist) {
+    for (int i = 0; i < s_ladderN; ++i) {
+        const Ladder& L = s_ladders[i];
+        const float dx = L.bot.x - hero.x, dy = L.bot.y - hero.y, d = sqrtf(dx * dx + dy * dy);
+        if (d > 130.0f || d < 1.0f) continue;
+        const float side = -(dx * L.n.x + dy * L.n.y);           // + : on the climbing side
+        if (fabsf(hero.z - L.bot.z) < 60.0f && side > 0.0f) { *toward = { dx / d, dy / d, 0.0f }; *atTop = false; *dist = d; return i; }
+        if (fabsf(hero.z - L.top.z) < 60.0f && side < 0.0f) { *toward = { dx / d, dy / d, 0.0f }; *atTop = true; *dist = d; return i; }
+    }
+    return -1;
+}
+static bool HandOnLadder(const Ladder& L, V3 hw, bool atTop) {
+    const float dx = hw.x - L.bot.x, dy = hw.y - L.bot.y;
+    if (sqrtf(dx * dx + dy * dy) > 45.0f) return false;
+    return atTop ? (hw.z > L.top.z - 70.0f && hw.z < L.top.z + 25.0f) : (hw.z > L.bot.z + 15.0f && hw.z < L.top.z + 40.0f);
+}
+static void ToStick(V3 w, float* sx, float* sy) { *sy = w.x * s_cy + w.y * s_sy; *sx = -w.x * s_sy + w.y * s_cy; }
+//  The ladder he is on: its axis is close and its rungs run over his height. -1: none.
+static int LadderNearHero(V3 hero) {
+    int best = -1; float bd = 1e9f;
+    for (int i = 0; i < s_ladderN; ++i) {
+        const Ladder& L = s_ladders[i];
+        const float dx = hero.x - L.bot.x, dy = hero.y - L.bot.y, d = sqrtf(dx * dx + dy * dy);
+        if (d > 130.0f || d >= bd) continue;
+        if (hero.z < L.bot.z - 60.0f || hero.z > L.top.z + 60.0f) continue;
+        bd = d; best = i;
+    }
+    return best;
+}
+static bool IsPaceSM(int sm) {   // the climbs that lift Miles: paced by the pull
+    switch (sm) { case 8: case 9: case 10: case 14: case 17: case 19: case 43: case 46: return true; }
+    return false;
+}
+// The pull speed (m/s) that plays a move at the game's own speed: one ~45 cm pull for the whole move.
+// Measured: ladder mount (43) 0.92 s, ladder exit over the top (46) 2.29 s; the ledge climbs ~1.5 s.
+static float PaceNominal(int sm) { return sm == 43 ? 0.49f : (sm == 46 ? 0.20f : 0.30f); }
+
+// The closest point of an edge to p; returns the horizontal distance.
+static float EdgeClosest(const Ledge& e, V3 p, V3* c) {
+    const V3 ab = Sub(e.b, e.a);
+    const float l2 = ab.x * ab.x + ab.y * ab.y + ab.z * ab.z;
+    float t = l2 > 1e-3f ? ((p.x - e.a.x) * ab.x + (p.y - e.a.y) * ab.y + (p.z - e.a.z) * ab.z) / l2 : 0.0f;
+    if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+    *c = Add(e.a, Mul(ab, t));
+    const float dx = p.x - c->x, dy = p.y - c->y;
+    return sqrtf(dx * dx + dy * dy);
+}
+// 1: the hand is on an edge (where it takes hold: just in front of and under the lip, so the fingers
+// close over it); 2: reaching up at an edge above its reach (it holds where it is). n: from the edge
+// toward you.
+static int HandOnEdge(V3 hw, V3* at, V3* n, V3* edgePt, int* idx = nullptr) {
+    int kind = 0; float bestScore = 1e9f;
+    for (int i = 0; i < s_ledgeN; ++i) {
+        V3 c; const float dh = EdgeClosest(s_ledges[i], hw, &c), dz = hw.z - c.z;
+        const float hx = s_headW.x - c.x, hy = s_headW.y - c.y, headD = sqrtf(hx * hx + hy * hy);
+        if (headD > 120.0f) continue;                                   // you are not at this edge
+        int k = 0;
+        // on the edge - and reaching for it: a hand hanging at your side next to a waist-high edge
+        // (squeezing to sprint) is not a climber
+        const float reach = ((hw.x - s_headW.x) * -hx + (hw.y - s_headW.y) * -hy) / (headD > 1.0f ? headD : 1.0f);
+        if (dh < 22.0f && dz > -28.0f && dz < 16.0f && reach > 15.0f) k = 1;
+        else if (dh < 30.0f && dz <= -28.0f && dz > -80.0f && hw.z > s_headW.z - 10.0f) k = 2;
+        if (!k) continue;
+        const float score = dh + fabsf(dz) + (k == 2 ? 40.0f : 0.0f);
+        if (score >= bestScore) continue;
+        bestScore = score; kind = k;
+        if (idx) *idx = i;
+        const float nl = headD > 1.0f ? headD : 1.0f;
+        *n = { hx / nl, hy / nl, 0.0f };
+        *edgePt = c;
+        *at = k == 1 ? V3{ c.x + n->x * 5.0f, c.y + n->y * 5.0f, c.z - 3.0f } : hw;
+    }
+    return kind;
+}
+// ---- [PHYSCLIMB] (Test43) your hands carry Miles ---------------------------------------------------
+// "Reverse engineer the climbing to make it more like a native VR game." Outlast climbs by playing
+// root-motion animations (its special moves, Test40/41); the guided climb only paced them. Here the
+// game's climb never runs. Squeeze a grip on a marked edge (OLLedgeMarker) or on a ladder's rungs
+// (OLLadderMarker) and that hand is fixed to the world: Miles's body moves so it stays there, 1:1 with
+// your real hand - pull down and he rises, pull in and he comes closer, move sideways and he shimmies -
+// through the engine's own collision-swept move (AActor::Move), his physics off while he hangs. Two
+// hands share the load, hand over hand. Get your head over a climbable edge and he hauls himself over
+// onto the top (a 0.5 s mantle); a ladder keeps him at its rungs and puts him on the floor at its top.
+// Let go of everything and he drops, with the push your hands gave him. Hang-only edges never let him
+// over. A scripted move, a cinematic or a menu hands him back to the game at once.
+//  [Motion] ClimbMode: 2 physical (this), 1 hybrid (this and the button), 0 the A button.
+// PHYSICAL only takes an edge that is over his head ([CLIMB] EdgeNeedsClimb): a lower one is a jump or a
+// vault, and that stays the game's. PHYSICAL itself never carries Miles: it asks the game to climb (the walk
+// stick and A), so the game's own jump, hang and mantle play. Jumping at a ledge that needs both hands, his LEFT
+// hand catches it by itself (PhysAutoCatch) and the right one stays free; squeezing the left grip takes that
+// hand over, and either hand then climbs (pull down) or lets go / goes back (push up) ([PHYSICAL] PhysHang /
+// PhysLadder). HYBRID still carries him with the hands as described above.
+static const int kPhysNone = 0, kPhysFalling = 2;
+static bool  s_pc = false;                       // the hands carry Miles
+static bool  s_pcSetPhys = false;                // his physics was switched off by us
+static int   s_pcEdge[2] = { -1, -1 };           // the edge a hand holds (-1: a rung of s_pcLadder)
+static int   s_pcLadder = -1;
+static V3    s_pcT0[2], s_pcB0[2];               // the tracked hand (m) and Miles (uu) when it took hold
+static float s_pcYaw0[2] = { 0.0f, 0.0f };
+static V3    s_pcPrevB = { 0, 0, 0 }, s_pcVel = { 0, 0, 0 };
+static int   s_pcMantle = 0;                     // 1: up, 2: over
+static bool  s_pcAuto[2] = { false, false };     //  Miles's own hand on the ledge: the body does not follow it
+static int   s_pcFinish = 0;                     //  1: the game was asked to finish the climb, 2: it is
+static ULONGLONG s_pcFinishUntil = 0;
+static V3    s_pcFinishTo = { 0, 0, 0 };
+static bool  s_pcOnLadder = false, s_pcHangLog = false;   // (Test45) every hold is a rung; Miles holds on with no hand
+static ULONGLONG s_pcMantleMs = 0, s_pcAboveMs = 0;
+static V3    s_pcMantleTo = { 0, 0, 0 };
+static float s_pcHalfH = 44.0f, s_pcRad = 22.0f;
+static bool PcReady() { return F.phys != 0 && OLUE3_HeroMoveReady() != 0; }
+static float BodyYaw() { return atan2f(s_sy, s_cy); }
+static void PcSetVel(void* hero, V3 v) { if (F.vel) { WrF(hero, F.vel, v.x); WrF(hero, F.vel + 4, v.y); WrF(hero, F.vel + 8, v.z); } }
+static void PcStop(const char* why, bool fall) {
+    if (!s_pc && !s_pcSetPhys) return;
+    void* hero = OLUE3_Hero();
+    if (s_pcSetPhys && hero) {
+        unsigned char ph = 0xFF;
+        if (Rd(hero, F.phys, &ph) && ph == kPhysNone) {
+            OLUE3_HeroSetPhysics(kPhysFalling);
+            V3 v = fall ? s_pcVel : V3{ 0, 0, 0 };
+            const float hs = sqrtf(v.x * v.x + v.y * v.y);
+            if (hs > 260.0f) { v.x *= 260.0f / hs; v.y *= 260.0f / hs; }
+            if (v.z > 260.0f) v.z = 260.0f; if (v.z < -300.0f) v.z = -300.0f;
+            PcSetVel(hero, v);
+        }
+    }
+    s_pc = false; s_pcSetPhys = false; s_pcMantle = 0; s_pcLadder = -1; s_pcAboveMs = 0; s_pcOnLadder = false; s_pcHangLog = false;
+    s_pcFinish = 0; s_pcAuto[0] = s_pcAuto[1] = false; s_crouchPrev = false;
+    for (int h = 0; h < 2; ++h) { s_hold[h] = false; s_holdLadder[h] = false; s_pcEdge[h] = -1; }
+    ILog("[OLVR][PHYSCLIMB] %s - Miles is the game's again", why);
+}
+static void PcCylinder(void* hero) {
+    void* cyl = nullptr; float hh = 0.0f, rr = 0.0f;
+    if (F.cyl && Rd(hero, F.cyl, &cyl) && cyl && F.cylH && Rd(cyl, F.cylH, &hh) && hh > 10.0f && hh < 200.0f) s_pcHalfH = hh;
+    if (cyl && F.cylR && Rd(cyl, F.cylR, &rr) && rr > 5.0f && rr < 100.0f) s_pcRad = rr;
+}
+// The ladder whose rungs this hand is on, anywhere up it (its markers sit at body height, so the rungs
+// run from about a body below the bottom one to the top one); -1: none.
+static int LadderUnderHand(V3 hw, V3 hero) {
+    for (int i = 0; i < s_ladderN; ++i) {
+        const Ladder& L = s_ladders[i];
+        const float dx = hw.x - L.bot.x, dy = hw.y - L.bot.y;
+        if (sqrtf(dx * dx + dy * dy) > 40.0f || hw.z < L.bot.z - 40.0f || hw.z > L.top.z + 110.0f) continue;   // its rails run on above the top
+        const float bx = hero.x - L.bot.x, by = hero.y - L.bot.y;
+        if (sqrtf(bx * bx + by * by) > 120.0f) continue;
+        return i;
+    }
+    return -1;
+}
+// Over the top: up until his feet clear `upZ`, then across to `to` - the engine's swept move all the way.
+static void PcMantle(ULONGLONG now, float dt, void* hero, V3 B) {
+    const float el = (float)(now - s_pcMantleMs) * 0.001f;
+    V3 d = { 0, 0, 0 };
+    if (s_pcMantle == 1) {
+        const float need = s_pcMantleTo.z - B.z;
+        if (need <= 1.0f) { s_pcMantle = 2; ILog("[OLVR][PHYSCLIMB] mantle: up (%.0f uu), now over the edge", s_pcMantleTo.z - s_pcPrevB.z); }
+        else d.z = need < 520.0f * dt ? need : 520.0f * dt;
+    }
+    if (s_pcMantle == 2) {
+        const float hx = s_pcMantleTo.x - B.x, hy = s_pcMantleTo.y - B.y, hl = sqrtf(hx * hx + hy * hy);
+        if (hl <= 2.0f) {
+            OLXR_HapticPulse(0, 0.7f, 60); OLXR_HapticPulse(1, 0.7f, 60);
+            Learn(LN_CLIMB);
+            s_pcVel = { 0, 0, 0 };
+            PcStop("mantled over onto the top", false);
+            return;
+        }
+        const float st = 300.0f * dt, k = hl < st ? 1.0f : st / hl;
+        d.x = hx * k; d.y = hy * k;
+    }
+    if (el > 1.4f) { PcStop("the mantle was blocked - he drops back", true); return; }
+    float nb[3]; OLUE3_HeroMove(&d.x, nb);
+}
+// (Test48) [RUNGRIP] this squeeze of the left hand is a sprint: the stick is pushed and the hand is low
+static bool RunGripLow(int h, const OLXrFrameHands& fh) {
+    if (!g_runGripLow || h != 0 || !s_moving) return false;
+    const float below = s_headT.y - P3(fh.hand[0]).y;
+    if (below < 0.45f) return false;
+    static ULONGLONG s_logMs = 0; const ULONGLONG now = GetTickCount64();
+    if (now - s_logMs > 5000) { s_logMs = now; ILog("[OLVR][RUNGRIP] left squeeze while running, hand %.2f m below the head: sprint, not an edge", below); }
+    return true;
+}
+
+static void PcStartMantle(ULONGLONG now, V3 B, V3 to, const char* what) {
+    s_pcMantle = 1; s_pcMantleMs = now; s_pcMantleTo = to; s_pcPrevB = B;
+    for (int h = 0; h < 2; ++h) { s_hold[h] = false; s_holdLadder[h] = false; s_pcEdge[h] = -1; }   // the hands come off
+    OLXR_HapticPulse(0, 0.5f, 40); OLXR_HapticPulse(1, 0.5f, 40);
+    ILog("[OLVR][PHYSCLIMB] %s: hauling himself over to (%.0f %.0f %.0f)", what, to.x, to.y, to.z);
+}
+//  The ledge a jump or a hang has his left hand on: the nearest climbable edge in reach of his head.
+// A platform he has to climb has its lip over his eyes (EdgeNeedsClimb); while the game hangs him the lip is
+// about at them, so the over-the-head rule is relaxed there (-30 uu) - the hang itself proves it is a climb.
+// In the air (jumping at a ledge) the rule is read against the eye height he took off from (`eyeZRef`), so the
+// jump itself cannot lift his eyes past the lip before the hand has caught it.
+static bool PcFindLedge(bool hanging, float eyeZRef, V3* c, V3* n, int* idx) {
+    int best = -1; float bestScore = 1e9f; V3 bestC = { 0, 0, 0 }, bestN = { 0, 0, 0 };
+    for (int i = 0; i < s_ledgeN; ++i) {
+        if (!s_ledges[i].up) continue;
+        V3 p; const float dh = EdgeClosest(s_ledges[i], s_headW, &p);
+        const float dz = p.z - s_headW.z;                           // the lip against his eyes
+        if (dh > 45.0f) continue;
+        // [HANGGRAB] WHAT COUNTS AS "A LEDGE TO TAKE HOLD OF".
+        //   hanging (already in the hang): the hang itself proves it is a ledge - anything within the band.
+        //   in the air: a lip ABOVE his eyes is a platform to climb (the shipped rule), and a lip at or just
+        //     below them is the one he jumps at TO HANG FROM. The old test applied the over-the-eyes rule to
+        //     both, so a hang lip level with his eyes was rejected for the first frames of the drop and the
+        //     hand only caught later: "jumping UP is instant, a hang ledge takes a while".
+        if (hanging) {
+            if (dz < -30.0f || dz > 60.0f) continue;                 // the band a hang can reach
+        } else {
+            const bool climbable = EdgeNeedsClimb(p.z, eyeZRef, (float)g_physEdgeAboveEyes);
+            const bool hangLip = dz >= -30.0f;                       // level with / just under the eyes
+            if (!climbable && !hangLip) continue;
+        }
+        const float hx = s_headW.x - p.x, hy = s_headW.y - p.y, hl = sqrtf(hx * hx + hy * hy);
+        if (hl < 1.0f) continue;
+        const float score = dh + fabsf(dz);
+        if (score >= bestScore) continue;
+        bestScore = score; best = i;
+        bestC = p; bestN = { hx / hl, hy / hl, 0.0f };
+    }
+    if (best < 0) return false;
+    *c = bestC; *n = bestN; *idx = best;
+    return true;
+}
+//  [CLIMBFINISH] The hands lifted him until his eyes reached the lip: give Miles back to the
+// game, which plays its own climb from there (the A press it would have taken), at its own speed. He is held
+// where the hands left him meanwhile; if the game finds nothing to climb after all, PcMantle hauls him over.
+static void PcHandOff(ULONGLONG now, V3 to) {
+    if (s_pcFinish) return;
+    s_pcFinish = 1; s_pcFinishUntil = now + 700; s_pcFinishTo = to;
+    for (int h = 0; h < 2; ++h) {
+        s_hold[h] = false; s_holdLadder[h] = false; s_pcAuto[h] = false; s_pcEdge[h] = -1;
+        OLXR_HapticPulse(h, 0.45f, 35);
+    }
+    void* hero = OLUE3_Hero();
+    if (hero) PcSetVel(hero, { 0, 0, 0 });                  // physics stays off while the game picks it up
+    s_pc = false; s_pcMantle = 0; s_pcOnLadder = false; s_pcAboveMs = 0;
+    s_aFrom = now; s_aUntil = now + 200;
+    s_climbByHands = false;                                 // (Test46) the game's own climb: at its own speed
+    ILog("[OLVR][CLIMBFINISH] his eyes are at the lip - the game takes the climb back and finishes it (A sent)");
+}
+static void PhysClimb(ULONGLONG now, float dt, const OLXrFrameHands& fh, V3 handW[2], bool handOk[2], int lm) {
+    void* hero = OLUE3_Hero(); V3 B;
+    if (!hero || !Rd(hero, F.loc, &B) || !Finite3(B)) { if (s_pc) PcStop("Miles is gone", false); return; }
+    //  [CLIMBFINISH] the game was asked to finish the climb the hands lifted him to
+    if (s_pcFinish == 1) {
+        if (lm == 2) {                       // its climb special move: the animation ends the climb
+            s_pcFinish = 2;
+            ILog("[OLVR][CLIMBFINISH] the game took the climb over - its own animation finishes it");
+        } else if (now > s_pcFinishUntil) {
+            ILog("[OLVR][CLIMBFINISH] the game found nothing to climb there - hauling him over");
+            s_pcFinish = 0;
+            PcStartMantle(now, B, s_pcFinishTo, "over the edge");
+        } else {
+            PcSetVel(hero, { 0, 0, 0 });     // held where the hands left him while the game picks it up
+        }
+        return;
+    }
+    if (s_pcFinish == 2) {
+        if (lm != 2) {                       // its climb is over (walking, hanging, a ladder): his physics is his own
+            unsigned char ph = 0xFF;
+            if (Rd(hero, F.phys, &ph) && ph == kPhysNone) OLUE3_HeroSetPhysics(kPhysFalling);
+            s_pcSetPhys = false; s_pcFinish = 0;
+            ILog("[OLVR][CLIMBFINISH] the game's climb is done - Miles is his own again");
+        }
+        return;
+    }
+    if (s_pc && !(lm == 0 || lm == 1 || lm == 4)) { PcStop("the game took over (its own move)", false); return; }
+    // the walk never carries him onto a ladder no hand has taken (the game mounts it by itself)
+    if (!s_pc && lm == 0) {
+        V3 tw; bool atTop = false; float ld = 1e9f;
+        if (LadderAt(B, &tw, &atTop, &ld) >= 0 && ld < LadderWalkBlock()) { ToStick(tw, &s_blockX, &s_blockY); s_blockOn = true; }
+    }
+    if (s_pcMantle) { PcMantle(now, dt, hero, B); return; }
+    const bool camHand = CamInRightHand() || g_camButton;   // (Test49) [CAMBUTTON] the right grip is the camcorder button
+    // ---- hands take hold, and let go
+    for (int h = 0; h < 2; ++h) {
+        if (s_hold[h] && (!handOk[h] || !s_gripDown[h])) {
+            s_hold[h] = false; s_holdLadder[h] = false; s_pcEdge[h] = -1; OLXR_HapticPulse(h, 0.15f, 15);
+            continue;
+        }
+        if (s_hold[h] || !handOk[h] || (h == 1 && camHand)  || s_grab[h].d) continue;
+        V3 at, n, ep; int ei = -1;
+        const int k = HandOnEdge(handW[h], &at, &n, &ep, &ei);
+        if (k == 1 && !s_gripDown[h]) { s_edgeNear = ep; s_edgeNearOn = true; }
+        if (!s_gripEdge[h]) continue;
+        // What this hand can take: an edge at its reach (kind 1), an edge above its reach that it is
+        // reaching up at (kind 2 - a platform taller than Miles looks exactly like that from below), or a
+        // ladder's rungs where it is .
+        const int li = k == 1 ? -1 : LadderUnderHand(handW[h], B);
+        const bool edgeHold = k == 1 || (k == 2 && li < 0);
+        if (!edgeHold && li < 0) continue;
+        //  only a platform he has to climb, with its lip over his head: a low one he jumps or
+        // vaults over, and that stays the game's button ([Motion] PhysClimbEdgeAboveEyes tunes the height).
+        if (edgeHold && !EdgeNeedsClimb(ep.z, s_headW.z, (float)g_physEdgeAboveEyes)) {
+            static ULONGLONG s_lowLog = 0;
+            if (now - s_lowLog > 4000) {
+                s_lowLog = now;
+                ILog("[OLVR][CLIMB] that edge is %+.0f uu from your eyes - a jump or a vault, not a physical climb (needs %ld over them)",
+                     ep.z - s_headW.z, g_physEdgeAboveEyes);
+            }
+            if (li < 0) continue;
+        }
+        if (k == 1 && RunGripLow(h, fh)) continue;   // (Test48) [RUNGRIP] sprint, not the edge (a rung is still taken)
+        //  [AUTOLEDGE] A tester: "Miles automatically grabbing onto a platform when jumping toward it
+        // and reaching for its edge", as an option. In the air the hands do not take the edge themselves - that
+        // stopped the jump dead (physics off) before the game could catch it. The game's own catch hangs him
+        // from it; from there the guided hang pulls up (both grips, pull down) or A climbs, B drops.
+        if (g_on[ON_AUTOLEDGE] && !s_pc && lm == 1 && k != 0) {
+            static ULONGLONG s_autoLog = 0;
+            if (now - s_autoLog > 2000) { s_autoLog = now; ILog("[OLVR][AUTOLEDGE] %s hand at an edge mid-air - leaving the catch to the game", h ? "right" : "left"); }
+            continue;
+        }
+        s_hold[h] = true; s_gripEdge[h] = false;
+        s_holdW[h] = edgeHold ? at : handW[h]; s_holdN[h] = n;
+        s_pcEdge[h] = edgeHold ? ei : -1; s_holdLadder[h] = !edgeHold;
+        if (!edgeHold) s_pcLadder = li;
+        //  the carry is anchored at where the controller hand actually is now - not at the ledge
+        // point (a different frame/units), so Miles does not jump sideways the moment a hand takes hold.
+        s_pcT0[h] = P3(fh.hand[h]); s_pcB0[h] = B; s_pcYaw0[h] = BodyYaw();
+        OLXR_HapticPulse(h, 0.5f, 35);
+        if (!s_pc) {
+            s_pc = true; s_pcPrevB = B; s_pcVel = { 0, 0, 0 }; s_pcAboveMs = 0; PcCylinder(hero);
+            s_pcSetPhys = OLUE3_HeroSetPhysics(kPhysNone) != 0; PcSetVel(hero, { 0, 0, 0 });
+            ILog("[OLVR][PHYSCLIMB] the %s hand holds %s - your hands carry Miles (body %.0f uu wide, %.0f tall)", h ? "right" : "left",
+                 edgeHold ? (ei >= 0 && ei < s_ledgeN && !s_ledges[ei].up ? "a hang-only edge" : "an edge") : "a ladder", 2.0f * s_pcRad, 2.0f * s_pcHalfH);
+        }
+    }
+    if (!s_pc) return;
+    //  the crouch button still descends while the hands carry him: it lets go and he slips down
+    // (on a ladder the block below does that already, and keeps him on it until you drop or step off).
+    // A press (edge) drops him - not a held button - and after dropping we ignore new grabs for a moment
+    // so Miles doesn't instantly re-grab the same ledge and end up crouched/stuck.
+    // s_crouchPrev only updates when crouch is actually detectable (off a ladder, past cooldown),
+    // so pressing it on a ladder doesn't lock the state and prevent drops later.
+    {
+        OLXrPad pp = {};
+        const unsigned crouchBtn = OLProxy_MouseUseEnabled() ? OLXR_BTN_X : OLXR_BTN_B;
+        const bool crouchNow = OLXR_GetPad(&pp) && (pp.buttons & crouchBtn) != 0 && (!OLProxy_MouseUseEnabled() || pp.gripL <= 0.6f);
+        if (!s_pcOnLadder && now > s_crouchCooldown) {
+            if (crouchNow && !s_crouchPrev) {
+                PcStop("the crouch button - he lets go and slips down", false);
+                s_crouchCooldown = now + 600;   // 600 ms before he can grab anything again
+                return;
+            }
+            s_crouchPrev = crouchNow;
+        }
+    }
+    if (!s_hold[0] && !s_hold[1]) {
+        // (Test45) a ladder holds you: let go of it part-way up and Miles stays on it - take a rung to climb on;
+        // at its foot, or with the crouch button, he steps off. (The user's session: let go mid-ladder twice and fell.)
+        if (s_pcOnLadder && s_pcLadder >= 0 && s_pcLadder < s_ladderN) {
+            OLXrPad pp = {};
+            const bool dropDown = OLXR_GetPad(&pp) &&
+                (pp.buttons & (OLProxy_MouseUseEnabled() ? OLXR_BTN_X : OLXR_BTN_B)) != 0 &&
+                (!OLProxy_MouseUseEnabled() || pp.gripL <= 0.6f);
+            if (B.z > s_ladders[s_pcLadder].bot.z + 15.0f && !dropDown) {
+                if (!s_pcHangLog) { s_pcHangLog = true; ILog("[OLVR][PHYSCLIMB] both hands off the ladder part-way up - Miles holds on (take a rung to climb on, %s to drop)", OLProxy_MouseUseEnabled() ? "X" : "B"); }
+                unsigned char hp = 0xFF;
+                if (Rd(hero, F.phys, &hp) && hp != kPhysNone) OLUE3_HeroSetPhysics(kPhysNone);
+                PcSetVel(hero, { 0, 0, 0 }); s_pcVel = { 0, 0, 0 };
+                return;
+            }
+            s_pcVel = { 0, 0, 0 };
+        }
+        PcStop("both hands let go - he drops", true); return;
+    }
+    s_pcHangLog = false;
+    unsigned char ph = 0xFF;                                          // keep his physics off (the game may switch it back)
+    if (Rd(hero, F.phys, &ph) && ph != kPhysNone) OLUE3_HeroSetPhysics(kPhysNone);
+    PcSetVel(hero, { 0, 0, 0 });
+    // ---- where Miles has to be for every holding hand to be back on its hold
+    const float yaw = BodyYaw();
+    V3 want = { 0, 0, 0 }; int n = 0, upHand = -1, capHand = -1; bool ladderOnly = true;
+    for (int h = 0; h < 2; ++h) {
+        if (!s_hold[h]) continue;
+        if (fabsf(Wrap180((yaw - s_pcYaw0[h]) * 57.2957795f)) > 0.5f) { s_pcT0[h] = P3(fh.hand[h]); s_pcB0[h] = B; s_pcYaw0[h] = yaw; }   // a turn: carry on from here
+        const V3 d = Sub(P3(fh.hand[h]), s_pcT0[h]);
+        const float f = -d.z * 100.0f, r = d.x * 100.0f, u = d.y * 100.0f;
+        want = Add(want, Sub(s_pcB0[h], V3{ s_cy * f - s_sy * r, s_sy * f + s_cy * r, u })); ++n;
+        if (!s_holdLadder[h]) {
+            ladderOnly = false;
+            const int ei = s_pcEdge[h];
+            if (ei >= 0 && ei < s_ledgeN && s_ledges[ei].up) upHand = h; else capHand = h;
+        }
+    }
+    if (!n) return;                                                     // only Miles's own hand holds him
+    want = Mul(want, 1.0f / (float)n);
+    s_pcOnLadder = ladderOnly;
+    //  on a ladder you climb hand over hand: with only one hand on the rungs he stays put
+    // (the ladder holds him) until the other hand takes a rung too - no climbing with just one hand.
+    if (ladderOnly && !s_hold[0] && !s_hold[1]) return;
+    if (ladderOnly && s_hold[0] != s_hold[1]) return;
+    const float eyeOff = s_headW.z - B.z;                              // his eye above his centre
+    if (ladderOnly && s_pcLadder >= 0 && s_pcLadder < s_ladderN) {
+        // a ladder: straight up and down it, at its rungs; at the top he steps onto the floor
+        //  a generous area near the top so he can finish the climb even when the hands
+        // are still below the lip.
+        const Ladder& L = s_ladders[s_pcLadder];
+        want.x = B.x; want.y = B.y;
+        if (want.z > L.top.z - 60.0f && B.z > L.top.z - 60.0f) {
+            const V3 to = { L.bot.x - L.n.x * (s_pcRad + 28.0f), L.bot.y - L.n.y * (s_pcRad + 28.0f), L.top.z + 3.0f };
+            PcStartMantle(now, B, to, "the top of the ladder");
+            return;
+        }
+    } else if (upHand >= 0) {
+        // an edge he can climb: head well over its lip and he goes over
+        // the edge at his chest (his eyes 50 uu over it) and he hauls himself over; earlier it lifted
+        // him most of the way (Test43 testing: 12 uu over, a 2.2 m auto-lift)
+        //  the lip is the edge marker's own height: a hold taken reaching up (HandOnEdge kind 2)
+        // sits at the hand, below the real lip, and the finish has to measure the real one.
+        V3 lipPt = s_holdW[upHand];
+        const int ei = s_pcEdge[upHand];
+        if (ei >= 0 && ei < s_ledgeN) EdgeClosest(s_ledges[ei], B, &lipPt);
+        const float lip = lipPt.z;
+        //  [CLIMBFINISH] near the top the game takes Miles back and ends the climb with its own
+        // animation - the hands did the climbing, the game plays the last of it, as its A button would.
+        // Not while he's still in the air from a jump: he hangs from the ledge instead.
+        // He has to have risen for it: a grip taken with his eyes already at the lip is not the top yet.
+        if (lm != 1 && B.z > s_pcB0[upHand].z + 15.0f && ClimbHandsOff(s_headW.z, lip, (float)g_physHandsOffUU)) {
+            const V3 nn = s_holdN[upHand];
+            PcHandOff(now, V3{ lipPt.x - nn.x * (s_pcRad + 16.0f), lipPt.y - nn.y * (s_pcRad + 16.0f), lip + 3.0f });
+            return;
+        }
+        if (s_headW.z > lip + 50.0f) { if (!s_pcAboveMs) s_pcAboveMs = now; } else s_pcAboveMs = 0;
+        if (s_pcAboveMs && now - s_pcAboveMs > 200) {
+            const V3 nn = s_holdN[upHand];
+            // Miles's Location is at his feet (measured: eyes 163-169 uu over it; standing on the scaffold
+            // he is 2 uu under its edge marker), and the markers sit on the lip itself: his feet go to it
+            const V3 to = { lipPt.x - nn.x * (s_pcRad + 16.0f), lipPt.y - nn.y * (s_pcRad + 16.0f), lip + 3.0f };
+            PcStartMantle(now, B, to, "over the edge");
+            return;
+        }
+    } else if (capHand >= 0) {
+        // a hang-only edge: his eyes stay under its lip
+        const float cap = s_holdW[capHand].z + 3.0f - 4.0f - eyeOff;
+        if (want.z > cap) want.z = cap;
+    }
+    V3 dl = Sub(want, B);
+    const float len = Len(dl);
+    if (len > 45.0f) dl = Mul(dl, 45.0f / len);                       // a tracking jump never throws him
+    if (len > 0.05f) { float nb[3]; OLUE3_HeroMove(&dl.x, nb); }
+    V3 B2 = B; Rd(hero, F.loc, &B2);
+    const V3 v = Mul(Sub(B2, s_pcPrevB), 1.0f / (dt > 0.004f ? dt : 0.004f));
+    s_pcVel = Add(Mul(s_pcVel, 0.7f), Mul(v, 0.3f)); s_pcPrevB = B2;
+    static ULONGLONG s_logMs = 0;
+    if (now - s_logMs > 1500) {
+        s_logMs = now;
+        ILog("[OLVR][PHYSCLIMB] carried: hands %d%d, Miles at (%.0f %.0f %.0f), wants %+.0f %+.0f %+.0f uu, eye %.0f uu over his centre",
+             s_hold[0], s_hold[1], B2.x, B2.y, B2.z, want.x - B2.x, want.y - B2.y, want.z - B2.z, eyeOff);
+    }
+}
+// ---- [PHYSICAL]  the game climbs, your hands ask for it ---------------------------------------
+// PHYSICAL keeps the game's own jump, hang, climb and ladder animations. The hands only say what the game should
+// do: the left hand catches a ledge by itself as he jumps at one; squeezing the left grip takes that hand over,
+// and either hand then pulls down to climb (the walk stick forward and A - the game's climb-up needs that push,
+// without it he hops and slides off) and pushes up to let go (the stick back and B); letting the owned left hand
+// go drops him unless the right hand still holds. On a ladder a hand takes a rung and each pull or push is one
+// step up or down, and going down the game plays its own descent animation with its own arm. A pull is
+// read in the room (from the head), not in the world, so the game's own climb cannot move the hand and push him on.
+static float s_stRef[2] = { 0.0f, 0.0f };                                   // the height a hand took its grip at (m)
+static bool  s_stPull[2] = { true, true }, s_stPush[2] = { true, true };    // which strokes may fire again
+static bool  s_stHeld[2] = { false, false };                                // a hand is on the ledge and driving
+static bool  s_lOwned = false;                                              // the player took the auto-grabbed left hand
+static ULONGLONG s_strokeActMs = 0;                                         // one climb/go-back per gesture
+static ULONGLONG s_ladderDownUntil = 0;                                     // descending a ladder: the game's own arm
+static ULONGLONG s_dropPulseAt = 0;                                         // the second buzz as he falls
+static ULONGLONG s_catchBlockUntil = 0;                                     // no auto-catch right after a drop
+static float s_eyeGroundZ = 165.0f;                                         // his eye height with his feet on the floor
+static float HandRelY(const OLXrFrameHands& fh, int h) { return fh.hand[h].py - fh.headRaw[1]; }
+// The left hand takes a ledge by itself while he jumps at one - from the floor (the game's jump-up, SMT 14-19) and in
+// the fall (move 1) - so it is already on the edge when the game hangs him (move 4), not a beat after. Only the hand
+// is held: his body stays the game's, nothing is frozen. It lets go when he lands or the edge slips out of reach,
+// and holds on while the game climbs up.
+static void PhysAutoCatch(ULONGLONG now, int lm, int sm) {
+    if (lm == 0 && !s_pc) s_eyeGroundZ = s_headW.z;                          // the height he jumps from
+    const bool climbUp = lm == 2 && IsClimbSM(sm) && sm < 40;                // a ledge jump-up or pull-up, not a ladder
+    // [HANGGRAB] A LEDGE YOU JUMP AT TO HANG FROM IS NOT A "CLIMB UP" MOVE.
+    // The catch used to wait for move 4 (already hanging) or move 1 (in the fall). A ledge you jump at to
+    // hang on is entered as move 2 with a HANG special move (bCanLedgeHang, not bCanClimbUp), so the hand
+    // did not reach for it until the game had already put him in the hang - the delay the player reports
+    // ("when I jump at a ledge to hang, the left hand takes a while; jumping UP catches instantly").
+    // The same reach is done for a hang move, from the frame the game enters it, so the hand is already on
+    // the edge when the hang starts.
+    const bool hangUp = lm == 2 && IsClimbSM(sm) && sm >= 40;
+    // the player took the auto-grabbed hand: it is theirs now - nothing holds it for him any more
+    if (s_lOwned) return;
+    if (lm == 4 && now < s_catchBlockUntil) return;                          // just dropped: no re-grab
+    if (lm == 4 || ((lm == 1 || climbUp || hangUp) && now >= s_catchBlockUntil)) {
+        V3 c = { 0, 0, 0 }, n = { 0, 0, 0 }; int idx = -1;
+        const bool found = PcFindLedge(lm == 4, lm == 4 || hangUp ? s_headW.z : s_eyeGroundZ, &c, &n, &idx);
+        if (found || lm == 4) {
+            if (!s_pcAuto[0]) {
+                OLXR_HapticPulse(0, 0.4f, 30);
+                ILog("[OLVR][CLIMBGRAB] his left hand takes the %s - the game's own catch follows",
+                     lm == 4 ? "ledge he hangs from" : (hangUp ? "ledge he jumps at to hang" : "ledge in reach"));
+            }
+            if (found) { s_holdW[0] = c; s_holdN[0] = n; s_pcEdge[0] = idx; }
+            s_hold[0] = true; s_pcAuto[0] = true; s_holdLadder[0] = false;
+            return;
+        }
+    }
+    if (climbUp || hangUp) return;                                           // climbing: keep the hand on it
+    if (!s_pcAuto[0]) return;                    // not our hold: a rung from the floor, an edge of his own
+    s_pcAuto[0] = false; s_hold[0] = false; s_pcEdge[0] = -1;                // on his feet again: the hand is free
+}
+// A held hand's stroke: how far it has moved down (+) or up (-) from where it took the grip. It is measured
+// against the head, so the game moving Miles never fakes one. Returns +1 (pulled), -1 (pushed) or 0.
+// [SHIMMY] The reference is re-taken both while a sideways walk is happening AND right after it, so the body
+// being carried along the ledge is never read as a pull (that is what made "any impulse climb him back up").
+static int PhysStroke(int h, const OLXrFrameHands& fh) {
+    if (!s_stHeld[h]) { s_stHeld[h] = true; s_stRef[h] = HandRelY(fh, h); s_stPull[h] = s_stPush[h] = true; }
+    return HandStroke(s_stRef[h] - HandRelY(fh, h), &s_stPull[h], &s_stPush[h]);
+}
+
+// What a ledge hand asks the game to do: a pull down climbs (A + the walk stick forward, which is what carries
+// him onto the platform), a push up goes back / lets go (B + the stick back). One action per gesture, even when
+// both hands pull together.
+static void PhysLedgeStroke(ULONGLONG now, int h, int ev) {
+    if (ev == 0 || now - s_strokeActMs < 300) return;
+    s_strokeActMs = now;
+    s_stepX = 0.0f;
+    if (ev > 0) {
+        s_aFrom = now; s_aUntil = now + 250;                                  // A: the game's climb-up
+        s_stepY = 1.0f; s_stepUntil = now + 900;                              // the walk stick forward: up onto the ledge
+        s_climbByHands = false;                                               // the game's own speed, not the hand's
+        // both hands on the ledge and squeezing: a buzz in each controller (one hand: just that one)
+        if (s_lOwned && s_gripDown[0] && s_gripDown[1]) {
+            OLXR_HapticPulse(0, 0.6f, 50); OLXR_HapticPulse(1, 0.6f, 50);
+        } else OLXR_HapticPulse(h, 0.6f, 50);
+        Learn(LN_CLIMB);
+        ILog("[OLVR][CLIMB] %s hand pulled down - climbing up (walk stick forward + A)", h ? "right" : "left");
+    } else {
+        s_bUntil = now + 200; s_catchBlockUntil = now + 1200;                 // B: let go
+        s_stepY = -1.0f; s_stepUntil = now + 500;                             // the walk stick back
+        OLXR_HapticPulse(h, 0.4f, 30);
+        ILog("[OLVR][CLIMB] %s hand pushed up - going back (walk stick back + B)", h ? "right" : "left");
+    }
+}
+// The hands on the ledge. Miles's left hand holds by itself (the game's pose) until the player closes that grip
+// on it, which makes it theirs: it climbs like the right one, and letting it go drops him unless the right hand
+// still holds. The right hand is always the player's; each held hand can pull down to climb or push up to go
+// back. Nothing is frozen - the game plays the hang and the climb.
+static void PhysHang(ULONGLONG now, const OLXrFrameHands& fh, bool handOk[2]) {
+    OLXrPad pp = {};
+    const unsigned crouchBtn = OLProxy_MouseUseEnabled() ? OLXR_BTN_X : OLXR_BTN_B;
+    const bool crouchNow = OLXR_GetPad(&pp) && (pp.buttons & crouchBtn) != 0 && (!OLProxy_MouseUseEnabled() || pp.gripL <= 0.6f);
+    if (crouchNow && !s_crouchPrev) s_catchBlockUntil = now + 1200;          // his own crouch drops him: no re-grab
+    s_crouchPrev = crouchNow;
+    const bool leftGrip = handOk[0] && s_gripDown[0];
+    const bool rightGrip = handOk[1] && s_gripDown[1];
+    if (s_pcAuto[0] && leftGrip) {                                            // the grip takes the auto-grabbed hand
+        s_pcAuto[0] = false; s_lOwned = true;
+        OLXR_HapticPulse(0, 0.55f, 45);
+        ILog("[OLVR][CLIMBGRAB] the left grip took the auto-grabbed hand - it is your hand now (let go and he drops)");
+    }
+    s_hold[0] = s_lOwned ? leftGrip : true;                                  // auto: always on the ledge
+    s_hold[1] = rightGrip;
+    // [LEDGEWALK] THE LEFT HAND DOES NOT LET GO OF A LEDGE HE CANNOT FALL FROM.
+    // Once the grip has taken the auto-grabbed hand, opening it used to drop him - but on a ledge the game
+    // itself will not let him fall, so letting go there only loses the hand. If the left grip opens while
+    // the right hand is NOT holding, Miles keeps his left hand on the ledge. (With the right hand holding he
+    // can still let the left go, which is what the two-hand ledge walk needs.)
+    if (s_lOwned && !leftGrip && !s_hold[1]) {
+        s_hold[0] = true;
+        static ULONGLONG s_keepLogMs = 0;
+        if (now - s_keepLogMs > 2000) {
+            s_keepLogMs = now;
+            ILog("[OLVR][CLIMBGRAB] the left grip opened without the right hand holding - Miles keeps his left hand on the ledge");
+        }
+    }
+    int ev = 0, fireH = 0;
+    if (s_lOwned && leftGrip) { const int e = PhysStroke(0, fh); if (e) { ev = e; fireH = 0; } }
+    else s_stHeld[0] = false;
+    if (rightGrip) { const int e = PhysStroke(1, fh); if (e && ev == 0) { ev = e; fireH = 1; } }
+    else s_stHeld[1] = false;
+    if (ev != 0) PhysLedgeStroke(now, fireH, ev);
+    // nothing holds the ledge: he drops (letting go of one hand does not drop him while the other holds)
+    if (!s_hold[0] && !s_hold[1]) {
+        if (!s_bothOffMs) s_bothOffMs = now;
+        else if (now - s_bothOffMs > 150) {
+            s_bothOffMs = 0; s_bUntil = now + 200; s_catchBlockUntil = now + 1200;
+            s_stepX = 0.0f; s_stepY = -1.0f; s_stepUntil = now + 500;
+            OLXR_HapticPulse(0, 0.6f, 50); s_dropPulseAt = now + 130;      // two buzzes, one after the other
+            ILog("[OLVR][CLIMB] let go of the ledge - dropping (B)");
+        }
+    } else s_bothOffMs = 0;
+}
+// The climb-up is the game's now: either hand's pull down asks it to keep climbing (A + the walk stick forward
+// again, if the climb stalled), and its push up reverses it (B + the stick back). Nothing is frozen.
+static void PhysClimbDrive(ULONGLONG now, const OLXrFrameHands& fh, bool handOk[2]) {
+    const bool leftGrip = handOk[0] && s_gripDown[0];
+    const bool rightGrip = handOk[1] && s_gripDown[1];
+    if (s_lOwned) s_hold[0] = leftGrip;
+    s_hold[1] = rightGrip;
+    int ev = 0, fireH = 0;
+    if (s_lOwned && leftGrip) { const int e = PhysStroke(0, fh); if (e) { ev = e; fireH = 0; } }
+    else s_stHeld[0] = false;
+    if (rightGrip) { const int e = PhysStroke(1, fh); if (e && ev == 0) { ev = e; fireH = 1; } }
+    else s_stHeld[1] = false;
+    if (ev != 0) PhysLedgeStroke(now, fireH, ev);
+}
+static void PhysLadder(ULONGLONG now, const OLXrFrameHands& fh, V3 handW[2], bool handOk[2], bool camHand) {
+    V3 hero = { 0, 0, 0 };
+    if (!Rd(OLUE3_Hero(), F.loc, &hero)) return;
+    s_ladderStickOn = false;
+    //  going DOWN is the game's own descent animation: the stick back (yours or the hands') plays
+    // it, and both arms stay the game's (OLInteract_ClimbHold) so the free hand is not forced open over it.
+    { OLXrPad pp = {}; if (OLXR_GetPad(&pp) && pp.moveY < -0.25f) s_ladderDownUntil = now + 250; }
+    for (int h = 0; h < 2; ++h) {
+        if (!handOk[h] || !s_gripDown[h]) {
+            if (s_hold[h]) { s_hold[h] = false; OLXR_HapticPulse(h, 0.15f, 15); }   // let go: the hand is open again
+            continue;
+        }
+        if (!s_hold[h]) {
+            if ((h == 1 && camHand) || LadderUnderHand(handW[h], hero) < 0) continue;
+            s_hold[h] = true; s_holdLadder[h] = false;
+            s_stRef[h] = HandRelY(fh, h); s_stPull[h] = s_stPush[h] = true;
+            OLXR_HapticPulse(h, 0.45f, 35); Learn(LN_CLIMB);
+            ILog("[OLVR][LADDERGRAB] %s hand took a rung", h ? "right" : "left");
+            continue;
+        }
+        const int ev = HandStroke(s_stRef[h] - HandRelY(fh, h), &s_stPull[h], &s_stPush[h]);
+        if (ev != 0) {
+            s_stepX = 0.0f; s_stepY = (float)ev; s_stepUntil = now + 600;
+            if (ev < 0) s_ladderDownUntil = now + 600;                 // the game's own descent animation
+            OLXR_HapticPulse(h, 0.35f, 25);
+            ILog("[OLVR][LADDERGRAB] %s hand %s - the ladder takes him %s", h ? "right" : "left",
+                 ev > 0 ? "pulled down" : "pushed up", ev > 0 ? "up a rung" : "down a rung");
+        }
+    }
+}
+static void Climb(ULONGLONG now, float dt, const OLXrFrameHands& fh, V3 handW[2], bool handOk[2]) {
+    if (s_dropPulseAt && now >= s_dropPulseAt) { s_dropPulseAt = 0; OLXR_HapticPulse(0, 0.9f, 60); }
+    int lm = 0, sm = 0;
+    OLUE3_HeroMoveState(&lm, &sm);
+    s_lm = lm; s_sm = sm; s_edgeNearOn = false;
+    // [CLIMBDIAG] one line per CHANGE of the climbing picture, so a shimmy that does not move him, or a
+    // hand that does not take the edge, can be read straight out of the log - never per frame.
+    {
+        static int s_pLm = -99, s_pSm = -99, s_pCl = -99, s_pHold = -99, s_pAuto = -99, s_pOwned = -99, s_pEdge = -99;
+        static ULONGLONG s_pMs = 0;
+        const int holdBits = (s_hold[0] ? 1 : 0) | (s_hold[1] ? 2 : 0);
+        const int autoBits = (s_pcAuto[0] ? 1 : 0) | (s_pcAuto[1] ? 2 : 0);
+        const int owned = s_lOwned ? 1 : 0;
+        const int edge = (s_pcEdge[0] << 8) | (s_pcEdge[1] & 0xFF);
+        if (lm != s_pLm || sm != s_pSm || s_cl != s_pCl || holdBits != s_pHold ||
+            autoBits != s_pAuto || owned != s_pOwned || edge != s_pEdge || now - s_pMs > 4000) {
+            s_pLm = lm; s_pSm = sm; s_pCl = s_cl; s_pHold = holdBits;
+            s_pAuto = autoBits; s_pOwned = owned; s_pEdge = edge; s_pMs = now;
+            ILog("[OLVR][CLIMBDIAG] mode=%d sm=%d state=%d holds=%d%d auto=%d%d ownedLeft=%d edges=%d/%d ledges=%d "
+                 "hands:%s%s grips=%d%d move=%s ladder=%d",
+                 lm, sm, s_cl, (holdBits & 1) ? 1 : 0, (holdBits & 2) ? 1 : 0,
+                 (autoBits & 1) ? 1 : 0, (autoBits & 2) ? 1 : 0, owned,
+                 s_pcEdge[0], s_pcEdge[1], s_ledgeN,
+                 handOk[0] ? "L" : "-", handOk[1] ? "R" : "-",
+                 s_gripDown[0] ? 1 : 0, s_gripDown[1] ? 1 : 0,
+                 OLUE3_HeroMoveReady() ? "ok" : "not-verified", s_pcOnLadder ? 1 : 0);
+        }
+    }
+    if (InterlockedExchange(&s_fakeReq, 0)) {
+        const V3 f = { s_cy, s_sy, 0.0f }, r = { -s_sy, s_cy, 0.0f };
+        const V3 c = { s_headW.x + f.x * 55.0f, s_headW.y + f.y * 55.0f, s_headW.z + (s_fakeUp != 0.0f ? s_fakeUp : -45.0f) };
+        s_fake.a = Sub(c, Mul(r, 30.0f)); s_fake.b = Add(c, Mul(r, 30.0f)); s_fake.up = true;
+        s_fakeUntil = now + 120000; s_ledgeMs = 0;
+        ILog("[OLVR][CLIMB] (dev) test edge for 2 min at (%.0f %.0f %.0f), 55 cm ahead, %+.0f cm from the eyes", c.x, c.y, c.z, c.z - s_headW.z);
+    }
+    if (!g_on[ON_CLIMB] || g_climbMode == CLIMB_A_BUTTON) { if (s_pc) PcStop("physical climbing is off", false); }
+    if (!g_on[ON_CLIMB]) {
+        if (s_cl != CL_IDLE || s_hold[0] || s_hold[1]) { s_cl = CL_IDLE; ClearHolds(); }
+        s_blockOn = false;
+        if (s_paceWritten != 1.0f) { OLUE3_SetHeroAnimRate(1.0f); s_paceWritten = 1.0f; }
+        return;
+    }
+    RefreshLedges(now);
+    RefreshLadders(now);
+    s_blockOn = false;
+    //  PHYSICAL: on a ladder the walk stick still backs him down it and, at its top, finishes the
+    // step off onto the floor ([CLIMB] ClimbStickRule). This is how far his feet are under that top.
+    s_climbTopUnder = 999.0f;
+    if (ClimbIsPhysicalLike(g_climbMode) && lm == 3) {
+        void* h = OLUE3_Hero(); V3 hb = { 0, 0, 0 };
+        if (h && Rd(h, F.loc, &hb) && Finite3(hb)) {
+            const int li = LadderNearHero(hb);
+            if (li >= 0) s_climbTopUnder = s_ladders[li].top.z - hb.z;
+        }
+    }
+    // (Test43) [PHYSCLIMB] PHYSICAL and HYBRID both let the game's own climb play and drive it with the
+    // hands ([CLIMB] + [CLIMBGRAB]).  HYBRID used to run a separate guided carry here;
+    // the report was that the two modes behaved differently, and they must not - the only difference is
+    // that HYBRID's walk stick may still push him forward ([HYBRIDSTICK]). So both fall through to the same
+    // state machine below.
+    const int prev = s_cl;
+    if (lm == 3) {
+        if (s_cl != CL_LADDER && ClimbIsPhysicalLike(g_climbMode)) {
+            // the rung a hand took from the floor stays held; its pull is measured from where the hand is now
+            for (int h = 0; h < 2; ++h) {
+                s_hold[h] = s_holdLadder[h]; s_holdLadder[h] = false;
+                if (s_hold[h]) { s_stRef[h] = HandRelY(fh, h); s_stPull[h] = s_stPush[h] = true; }
+            }
+            s_ladderStickOn = false; s_hangHeld = false; s_bothHeldPrev = false;
+            s_cl = CL_LADDER;
+        } else if (s_cl != CL_LADDER) {
+            //  the step-on already holds a rung: keep that hand and let it drive the first pull,
+            // so the climb starts the moment the game mounts - no re-grab after stepping on. Re-anchor it to
+            // where the hand is NOW, so the mount's body lift is not read as a pull that jumps a rung.
+            s_ladderDriver = s_holdLadder[0] ? 0 : (s_holdLadder[1] ? 1 : -1);
+            s_hold[0] = s_holdLadder[0]; s_hold[1] = s_holdLadder[1];
+            if (s_ladderDriver >= 0) s_holdW[s_ladderDriver] = handW[s_ladderDriver];
+            s_holdLadder[0] = s_holdLadder[1] = false;
+            s_ladderStickOn = false; s_hangHeld = false; s_bothHeldPrev = false;
+            s_cl = CL_LADDER;
+        }
+    }
+    else if (lm == 4) { if (s_cl != CL_HANG) { s_cl = CL_HANG; s_hangHeld = false; s_bothHeldPrev = false; s_bothOffMs = 0; s_lOwned = false; s_stHeld[0] = s_stHeld[1] = false; } }
+    else if (lm == 2 && IsClimbSM(sm)) { if (s_cl != CL_CLIMBING) s_cl = CL_CLIMBING; }
+    else if (s_cl == CL_PULLING) {
+        if (s_stepping) {
+            const float ex = s_holdW[s_stepHand].x - s_headW.x, ey = s_holdW[s_stepHand].y - s_headW.y;
+            if (sqrtf(ex * ex + ey * ey) <= 38.0f || now >= s_stepUntil) {
+                s_stepping = false; s_stepUntil = now; s_aFrom = now + 70; s_aUntil = now + 230;
+            }
+        }
+        if (now - s_clMs > 1300) {
+            ILog("[OLVR][CLIMB] pulled, but the game found nothing to climb here (move %d, special %d)", lm, sm);
+            s_cl = CL_IDLE;
+        }
+    }
+    else if (s_cl != CL_IDLE) { ClearHolds(); s_cl = CL_IDLE; }
+    if (prev != s_cl) ILog("[OLVR][CLIMB] %s -> %s (move %d, special %d)", kClName[prev], kClName[s_cl], lm, sm);
+    if (ClimbIsPhysicalLike(g_climbMode)) {
+        PhysAutoCatch(now, lm, sm);
+        // the hang is over (he is on his feet, on a ladder, or walking): a new one starts with the auto-grab
+        if (s_cl != CL_HANG && s_cl != CL_CLIMBING) s_lOwned = false;
+    }
+    const bool camHand = CamInRightHand() || g_camButton;   // (Test49) [CAMBUTTON] the right grip is the camcorder button
+    switch (s_cl) {
+    case CL_IDLE: case CL_PULLING: {
+        // (Test41) [LADDERGRAB] at a ladder: a hand that squeezes on its rungs takes it (Miles steps on
+        // as you pull); otherwise the stick stops short of it - no more walking onto it by accident
+        if (lm == 0) {
+            V3 hero = { 0, 0, 0 }, tw = { 0, 0, 0 }; bool atTop = false; float ld = 1e9f;
+            const bool heroOk = Rd(OLUE3_Hero(), F.loc, &hero);
+            const int li = heroOk ? LadderAt(hero, &tw, &atTop, &ld) : -1;
+            if (li >= 0) {
+                for (int h = 0; h < 2; ++h) {
+                    if (s_holdLadder[h] && (!s_gripDown[h] || !handOk[h])) { s_hold[h] = s_holdLadder[h] = false; continue; }
+                    if (!s_hold[h] && s_gripEdge[h] && handOk[h] && !(h == 1 && camHand) && HandOnLadder(s_ladders[li], handW[h], atTop)) {
+                        s_hold[h] = s_holdLadder[h] = true; s_holdW[h] = handW[h];
+                        s_ladderTakeUntil = now + 800;
+                        OLXR_HapticPulse(h, 0.45f, 35);
+                        ILog("[OLVR][LADDERGRAB] %s hand took the ladder %s - stepping on", h ? "right" : "left", atTop ? "from the top" : "at its foot");
+                    }
+                }
+                if ((s_holdLadder[0] || s_holdLadder[1]) && now < s_ladderTakeUntil) {
+                    float sx, sy; ToStick(tw, &sx, &sy);
+                    s_stepX = sx * 0.8f; s_stepY = sy * 0.8f; s_stepUntil = now + 50;
+                } else if (!(s_holdLadder[0] || s_holdLadder[1]) && ld < LadderWalkBlock()) {
+                    ToStick(tw, &s_blockX, &s_blockY); s_blockOn = true;
+
+                }
+            } else for (int h = 0; h < 2; ++h) if (s_holdLadder[h]) s_hold[h] = s_holdLadder[h] = false;
+        }
+        if (ClimbIsPhysicalLike(g_climbMode)) break;      // PHYSICAL grabs edges only by the auto-catch, and ladders above
+        for (int h = 0; h < 2; ++h) {
+            if (!handOk[h]) { s_hold[h] = false; continue; }
+            if (s_holdLadder[h]) continue;                                  // holding a ladder, not an edge
+            if (s_hold[h] && (!s_gripDown[h] || Len(Sub(handW[h], s_holdW[h])) > 55.0f || lm != 0)) {
+                s_hold[h] = false; OLXR_HapticPulse(h, 0.15f, 15);
+                continue;
+            }
+            if (s_hold[h] || lm != 0 || (h == 1 && camHand)) continue;
+            V3 at, n, ep; const int k = HandOnEdge(handW[h], &at, &n, &ep);
+            if (k && !s_gripDown[h]) { s_edgeNear = ep; s_edgeNearOn = true; }
+            if (k && s_gripEdge[h] && !RunGripLow(h, fh)) {   // (Test48) [RUNGRIP]
+                s_hold[h] = true; s_holdW[h] = at; s_holdN[h] = n;
+                OLXR_HapticPulse(h, 0.45f, 35);
+                ILog("[OLVR][CLIMB] %s hand %s (edge at %.0f %.0f %.0f, hand %.0f uu below its top)", h ? "right" : "left",
+                     k == 1 ? "took hold of the edge" : "reached up at an edge above", ep.x, ep.y, ep.z, ep.z - handW[h].z);
+            }
+        }
+        // both hands hold on - or the left does and the right holds the camcorder
+        const bool camOk = camHand && s_hold[0];
+        if (s_cl == CL_IDLE && !s_holdLadder[0] && !s_holdLadder[1] && s_hold[0] && (s_hold[1] || camOk)) {
+            // pulled: both real hands below / toward you from where they took hold
+            float p = 1e9f;
+            for (int h = 0; h < 2; ++h) {
+                if (!s_hold[h]) continue;
+                const float down = s_holdW[h].z - handW[h].z;
+                const float back = (handW[h].x - s_holdW[h].x) * s_holdN[h].x + (handW[h].y - s_holdW[h].y) * s_holdN[h].y;
+                const float ph = down > back * 0.8f ? down : back * 0.8f;
+                if (ph < p) p = ph;
+            }
+            if (!s_pullArmed && p < 5.0f) s_pullArmed = true;
+            if (s_pullArmed && p > 11.0f) {
+                // More than ~40 cm from the edge: a half-stick step toward it first (in Miles's own frame -
+                // the stick moves him relative to his facing), up to 0.35 s, and A only once he has
+                // STOPPED: A while moving is the game's running jump (it threw him 2 m forward in testing
+                // where there was nothing to climb), A standing still is a climb - or a hop in place.
+                const int hh = s_hold[0] ? 0 : 1;
+                const V3 n = s_holdN[hh];
+                const float ex = s_holdW[hh].x - s_headW.x, ey = s_holdW[hh].y - s_headW.y;
+                s_stepHand = hh;
+                if (sqrtf(ex * ex + ey * ey) > 40.0f) {
+                    const float fx = -n.x, fy = -n.y;
+                    s_stepY = fx * s_cy + fy * s_sy; s_stepX = -fx * s_sy + fy * s_cy;
+                    const float sl = sqrtf(s_stepX * s_stepX + s_stepY * s_stepY);
+                    if (sl > 0.01f) { s_stepX *= 0.6f / sl; s_stepY *= 0.6f / sl; }
+                    s_stepping = true; s_stepUntil = now + 350; s_aFrom = s_aUntil = 0;
+                } else { s_stepping = false; s_stepUntil = 0; s_aFrom = now; s_aUntil = now + 160; }
+                s_cl = CL_PULLING; s_clMs = now; s_pullArmed = false; s_climbByHands = true;
+                OLXR_HapticPulse(0, 0.6f, 50); OLXR_HapticPulse(1, 0.6f, 50);
+                Learn(LN_CLIMB);
+                ILog("[OLVR][CLIMB] both hands pulled (%.0f uu) - climbing (A)", p);
+            }
+        }
+        break;
+    }
+    case CL_CLIMBING:
+        if (ClimbIsPhysicalLike(g_climbMode)) {
+            PhysClimbDrive(now, fh, handOk);   // the left stays on the ledge
+            // the game's climb wants the walk stick forward for as long as it runs (that is what lifts him
+            // onto the ledge, not a hop in place) - and only for as long as a hand the player owns holds it.
+            if (s_stepY > 0.0f && (s_hold[1] || (s_lOwned && s_hold[0])) && lm == 2) s_stepUntil = now + 250;
+            break;
+        }
+        for (int h = 0; h < 2; ++h) s_hold[h] = handOk[h] && s_gripDown[h];   // holding on: his climbing arm
+        break;
+    case CL_HANG: {
+        if (ClimbIsPhysicalLike(g_climbMode)) { PhysHang(now, fh, handOk); break; }
+        for (int h = 0; h < 2; ++h) s_hold[h] = handOk[h] && s_gripDown[h];
+        const bool both = s_hold[0] && s_hold[1];
+        if (both) {
+            if (!s_bothHeldPrev) {
+                for (int h = 0; h < 2; ++h) s_holdRefY[h] = fh.hand[h].py - fh.headRaw[1];
+                s_pullArmed = true;
+                if (!s_hangHeld) ILog("[OLVR][CLIMB] holding on to the ledge with both hands");
+            }
+            s_hangHeld = true; s_bothOffMs = 0;
+            float p = 1e9f;
+            for (int h = 0; h < 2; ++h) { const float ph = s_holdRefY[h] - (fh.hand[h].py - fh.headRaw[1]); if (ph < p) p = ph; }
+            if (s_pullArmed && p > 0.12f) {
+                s_aUntil = now + 160; s_aFrom = now; s_pullArmed = false; s_climbByHands = true;
+                OLXR_HapticPulse(0, 0.6f, 50); OLXR_HapticPulse(1, 0.6f, 50);
+                Learn(LN_CLIMB);
+                ILog("[OLVR][CLIMB] pulled up from the ledge (%.2f m) - climbing up (A)", p);
+            }
+        } else if (s_hangHeld && !s_hold[0] && !s_hold[1]) {
+            if (!s_bothOffMs) s_bothOffMs = now;
+            else if (now - s_bothOffMs > 300) {
+                s_bUntil = now + 160; s_hangHeld = false; s_bothOffMs = 0;
+                ILog("[OLVR][CLIMB] let go of the ledge - dropping (B)");
+            }
+        } else s_bothOffMs = 0;
+        s_bothHeldPrev = both;
+        break;
+    }
+    case CL_LADDER: {
+        if (ClimbIsPhysicalLike(g_climbMode)) { PhysLadder(now, fh, handW, handOk, camHand); break; }
+        for (int h = 0; h < 2; ++h) {
+            if (!handOk[h] || !s_gripDown[h]) {
+                if (s_hold[h]) { s_hold[h] = false; if (s_ladderDriver == h) s_ladderDriver = s_hold[1 - h] ? 1 - h : -1; }
+                continue;
+            }
+            if (!s_hold[h] && s_gripEdge[h]) {
+                s_hold[h] = true; s_holdW[h] = handW[h]; s_ladderDriver = h;
+                OLXR_HapticPulse(h, 0.35f, 25);
+                Learn(LN_CLIMB);
+            }
+        }
+        // the hand that took a rung last pulls: Miles climbs until it is back at the rung (one hand after
+        // the other - the driver is whichever hand grabbed most recently).
+        s_ladderStickOn = false;
+        s_holdLadder[0] = s_holdLadder[1] = false;
+        if (s_ladderDriver >= 0 && s_hold[s_ladderDriver]) {
+            const float err = s_holdW[s_ladderDriver].z - handW[s_ladderDriver].z;   // + : the hand is below its rung
+            float st = fabsf(err) < 2.0f ? 0.0f : err / 12.0f;
+            if (st > 1.0f) st = 1.0f; if (st < -1.0f) st = -1.0f;
+            s_ladderStick = st; s_ladderStickOn = true;
+        }
+        break;
+    }
+    }
+    // ---- [CLIMBPACE] the climb's animation speed follows the pull of the holding hands ------------------
+    const float relY[2] = { fh.hand[0].py - fh.headRaw[1], fh.hand[1].py - fh.headRaw[1] };
+    if (s_cl == CL_IDLE && lm == 0) s_climbByHands = false;
+    const bool paceable = s_climbByHands && s_cl == CL_CLIMBING && lm == 2 && IsPaceSM(sm) && (s_hold[0] || s_hold[1]) && !s_paceGaveUp;
+    if (paceable) {
+        float v = 0.0f; int n = 0;
+        if (s_prevRelOk && dt > 0.0f) for (int h = 0; h < 2; ++h) if (s_hold[h]) { v += (s_prevRelY[h] - relY[h]) / dt; ++n; }
+        if (n) v /= (float)n;                                              // m/s, + = pulling down
+        float target = v / PaceNominal(sm);
+        if (target < 0.0f) target = 0.0f; if (target > 1.8f) target = 1.8f;
+        s_paceRate += (target - s_paceRate) * (1.0f - expf(-dt / 0.08f));
+        if (s_paceRate < 0.05f) {
+            if (!s_pausedSince) s_pausedSince = now;
+            else if (now - s_pausedSince > 5000) {
+                s_paceGaveUp = true; s_paceRate = 1.0f;
+                ILog("[OLVR][CLIMBPACE] no pull for 5 s - the game finishes the climb by itself");
+            }
+        } else s_pausedSince = 0;
+        static ULONGLONG s_logMs = 0;
+        if (now - s_logMs > 700) { s_logMs = now; ILog("[OLVR][CLIMBPACE] special %d: pull %.2f m/s -> climb speed %.0f%%", sm, v, s_paceRate * 100.0f); }
+    } else {
+        s_paceRate = 1.0f; s_pausedSince = 0;
+        if (!(s_cl == CL_CLIMBING && lm == 2)) s_paceGaveUp = false;      // a new move gets paced again
+    }
+    s_prevRelY[0] = relY[0]; s_prevRelY[1] = relY[1]; s_prevRelOk = true;
+    if (paceable || s_paceWritten != 1.0f) { OLUE3_SetHeroAnimRate(s_paceRate); s_paceWritten = s_paceRate; }
+}
+// (Test41) [LADDERGRAB] the player's own walk stick never pushes Miles onto a ladder he has not taken.
+// Any thread that holds the stick (the XInput hook, the dev pad); reads only.
+extern "C" void OLInteract_FilterMoveStick(float* x, float* y) {
+    if (!x || !y || !s_tickMs || GetTickCount64() - s_tickMs > 250) return;
+    // [LEDGEWALK] HANGING FROM A LEDGE: THE STICK WALKS THE LEDGE ONLY WITH BOTH HANDS HOLDING.
+    // Walking sideways on a ledge is the GAME's own move (LocomotionMode 4/5) and it takes the walk stick -
+    // which is why the mod used to leave it to the game. But it must not start on a hand that is not
+    // holding: with one hand off, the ledge belongs to the other. This is the only place the ledge walk is
+    // gated, so ClimbStickRule itself stays the one rule PHYSICAL and HYBRID share.
+    if (ClimbIsPhysicalLike(g_climbMode) && (s_lm == 4 || s_lm == 5) && !s_pc) {
+        if (!(s_hold[0] && s_hold[1])) {
+            *x = 0.0f; *y = 0.0f;
+            static ULONGLONG s_oneHandMs = 0; const ULONGLONG n = GetTickCount64();
+            if (n - s_oneHandMs > 3000) {
+                s_oneHandMs = n;
+                ILog("[OLVR][CLIMB] the ledge walk needs BOTH hands holding (left=%d right=%d) - the stick is off",
+                     s_hold[0] ? 1 : 0, s_hold[1] ? 1 : 0);
+            }
+            return;
+        }
+    }
+    //  PHYSICAL / HYBRID: what the walk stick may do where he is ([CLIMB] ClimbStickRule).
+    // Behind him and beside him it is always his; in front of him it belongs to the rungs - except on the
+    // floor at a ladder (a hand on a rung walks him onto it, so the game mounts it) and at the top of one
+    // (the step off). (phase 8) HYBRID is the same, plus [HYBRIDSTICK]: forward is not taken from it.
+    if (ClimbIsPhysicalLike(g_climbMode)) {
+        const bool ladderHold = (s_holdLadder[0] || s_holdLadder[1] || s_pcOnLadder) &&
+                                (s_pc || s_cl == CL_LADDER);
+        const bool edgeCarry = s_pc && !ladderHold;
+        const int rule = ClimbStickRuleHybrid((int)g_climbMode, s_lm, ladderHold, edgeCarry,
+                                              s_climbTopUnder, *y > 0.05f);
+        static ULONGLONG s_logMs = 0; const ULONGLONG now = GetTickCount64();
+        if (rule == CLIMB_STICK_LOCKED) {
+            *x = 0.0f; *y = 0.0f;
+            if (now - s_logMs > 3000) { s_logMs = now; ILog("[OLVR][PHYSCLIMB] physical climbing: the walk stick is off while your hands carry him (move %d)", s_lm); }
+            return;
+        }
+        if (rule == CLIMB_STICK_DOWN_ONLY && *y > 0.0f) {
+            *y = 0.0f;                       // mid-ladder: forward is the hands' - back still climbs him down
+            if (now - s_logMs > 3000) { s_logMs = now; ILog("[OLVR][PHYSCLIMB] physical climbing: on the ladder the stick only backs him down (move %d)", s_lm); }
+        }
+    }
+    if (!s_blockOn) return;
+    const float d = *x * s_blockX + *y * s_blockY;
+    if (d > 0.0f) {
+        *x -= s_blockX * d; *y -= s_blockY * d;
+        static ULONGLONG s_logMs = 0; const ULONGLONG now = GetTickCount64();
+        if (now - s_logMs > 3000) { s_logMs = now; ILog("[OLVR][LADDERGRAB] walk held short of a ladder no hand has taken"); }
+    }
+}
+static bool CamInRightHand() { return HolsterOn() && s_hState == H_IN_HAND; }
+// [DEVBRIDGE] (Test40) "doors": every door within 15 m of Miles, nearest first (any thread; read only).
+extern "C" void OLInteract_DevDoors() {
+    if (!Resolve()) return;
+    void* all[512]; const int n = OLUE3_ObjectsOfClass("OLDoor", all, 512);
+    V3 hero = { 0, 0, 0 }; Rd(OLUE3_Hero(), F.loc, &hero);
+    struct E { NearDoor d; float dist; } best[10]; int k = 0;
+    for (int i = 0; i < n; ++i) {
+        NearDoor nd;
+        if (!ReadDoor(all[i], &nd)) continue;
+        const float dist = Len(Sub(nd.knob, hero));
+        if (dist > 1500.0f) continue;
+        int j = k < 10 ? k++ : 9;
+        if (j == 9 && k == 10 && best[9].dist <= dist) continue;
+        while (j > 0 && best[j - 1].dist > dist) { best[j] = best[j - 1]; --j; }
+        best[j].d = nd; best[j].dist = dist;
+    }
+    ILog("[OLVR][DEVDOORS] Miles at (%.0f %.0f %.0f); %d doors; nearest:", hero.x, hero.y, hero.z, n);
+    for (int i = 0; i < k; ++i) {
+        const NearDoor& d = best[i].d;
+        ILog("[OLVR][DEVDOORS]   %4.0f uu: knob (%.0f %.0f %.0f) hinge (%.0f %.0f) ratio %.2f max %.0f%s%s%s%s", best[i].dist, d.knob.x, d.knob.y, d.knob.z,
+             d.hinge.x, d.hinge.y, d.ratio, d.maxAng, d.locked ? " LOCKED" : "", d.rev ? " rev" : "", d.cant ? " cantClose" : "", d.busy ? " BUSY" : "");
+    }
+}
+// [DEVBRIDGE] (Test40) "ledges": the nearest climbable edges to Miles (any distance), for tests.
+extern "C" void OLInteract_DevLedges() {
+    if (!Resolve() || !F.lmNext) { OLProxyLog("[OLVR][DEVLEDGES] ledge fields not resolved"); return; }
+    s_lmkN = OLUE3_ObjectsOfClass("OLLedgeMarker", s_lmk, 1024); s_lmkMs = GetTickCount64();
+    V3 hero = { 0, 0, 0 }; Rd(OLUE3_Hero(), F.loc, &hero);
+    struct E { V3 a, b; float d; uint32_t bits; } best[12]; int n = 0;
+    for (int i = 0; i < s_lmkN; ++i) {
+        V3 a, b; void* nx = nullptr; uint32_t bits = 0;
+        if (!Rd(s_lmk[i], F.loc, &a) || !Rd(s_lmk[i], F.lmNext, &nx) || !nx || !Rd(nx, F.loc, &b) || !Finite3(a) || !Finite3(b)) continue;
+        if (F.lmBits) Rd(s_lmk[i], F.lmBits, &bits);
+        Ledge L = { a, b }; V3 c; const float dh = EdgeClosest(L, hero, &c);
+        const float d = sqrtf(dh * dh + (c.z - hero.z) * (c.z - hero.z));
+        E e = { a, b, d, bits };
+        int j = n < 12 ? n++ : 11;
+        if (j == 11 && n == 12 && best[11].d <= d) continue;
+        while (j > 0 && best[j - 1].d > d) { best[j] = best[j - 1]; --j; }
+        best[j] = e;
+    }
+    ILog("[OLVR][DEVLEDGES] Miles at (%.0f %.0f %.0f); %d markers; nearest edges (climbUp=0x%X hang=0x%X):", hero.x, hero.y, hero.z, s_lmkN, F.mClimbUp, F.mHang);
+    for (int i = 0; i < n; ++i)
+        ILog("[OLVR][DEVLEDGES]   %5.0f uu: (%.0f %.0f %.0f) -> (%.0f %.0f %.0f) bits 0x%X", best[i].d, best[i].a.x, best[i].a.y, best[i].a.z,
+             best[i].b.x, best[i].b.y, best[i].b.z, best[i].bits);
+}
+
+// ---- what the headset draws: how-to labels and glows first, then the developer rings -----------------
+// ---- [HANDNV] (Test43) night vision on the camcorder in your hand ---------------------------------
+// "Activate the night vision on free hold ... for players wanting more realism." Outlast only lets night
+// vision run with the camcorder at your eye. In your hand, a right-stick click now switches the
+// camcorder's own night vision: its live flip screen amplifies the low light like the real thing (your
+// own eyes stay in the dark), or shows the normal colour picture. It is one switch with the game's: at
+// your eye the game's night vision follows it (a click is sent if they differ), and what you set at your
+// eye carries back into your hand.
+static int s_handNV = -1;                       // -1: not known yet (taken from the game)
+static ULONGLONG s_nvUpMs = 0, s_nvPulseUntil = 0, s_nvAdoptAt = 0;
+extern "C" int OLInteract_HandNV() { return s_handNV > 0 ? 1 : 0; }
+static void HandNV(ULONGLONG now, const OLXrPad& p, void* hero) {
+    (void)p;
+    //  [FACECAM] CamHoldGesture owns the right stick's press and hold. A short click
+    // is still the night-vision switch; a held one raised/lowered the camcorder and must not also
+    // toggle it.
+    const bool shortClick = s_rsShort;
+    s_rsShort = false;
+    unsigned char mode = 0;
+    const bool modeOk = F.camMode && Rd(hero, F.camMode, &mode);
+    if (s_handNV < 0 && modeOk) s_handNV = mode != 0 ? 1 : 0;
+    if (s_camUp == 1) {
+        // The game's night vision is left exactly as the game starts it: no click is sent at the eye.
+        // Its state is only read, so the flip screen and the hand setting follow what is shown.
+        if (modeOk) { s_handNV = mode != 0 ? 1 : 0; OLProxy_SetNvRequested(s_handNV); }
+        return;
+    }
+    s_nvUpMs = 0;
+    if (shortClick && CamInRightHand()) {
+        s_handNV = s_handNV > 0 ? 0 : 1;
+        OLXR_HapticPulse(1, 0.3f, 25);
+        ILog("[OLVR][HANDNV] night vision %s on the camcorder in your hand", s_handNV ? "ON" : "OFF");
+    }
+}
+
+// ---- [BREATH] (Test43) cover your mouth -------------------------------------------------------------
+// The surprise: whenever Miles is breathing hard - after a run, scared, hurt, hiding in a locker -
+// put a hand over your mouth and he holds his breath. His breathing (the game's own breath sounds,
+// ol_sound.cpp) goes quiet under your hand and you feel his heart pound in that controller; take the
+// hand away and he lets it out. Nobody holds it forever: after 12 s he gasps for air by himself.
+// A hand holding something (camcorder, door, edge, battery) is not a hand over the mouth.
+static bool s_cover = false, s_hushed = false; static int s_coverHand = -1;
+static ULONGLONG s_coverMs = 0, s_beatMs = 0, s_dubMs = 0, s_breathCool = 0;
+static V3 s_mouth = { 0, 0, 0 }; static bool s_mouthOk = false; static bool s_heavyNow = false;
+static void BreathRelease(ULONGLONG now, const char* why) {
+    if (s_hushed) {
+        OLSound_Hush(0);
+        const ULONGLONG held = now - s_coverMs;
+        if (held >= 2500) OLSound_Gasp();
+        if (held >= 1500) Learn(LN_BREATH);
+        ILog("[OLVR][BREATH] %s after %.1f s", why, (float)held * 0.001f);
+    }
+    s_hushed = false; s_cover = false; s_coverHand = -1;
+}
+static void Breath(ULONGLONG now, const OLXrPose& head, const OLXrFrameHands& fh, int lm) {
+    s_mouthOk = false; s_heavyNow = false;
+    if (!g_on[ON_BREATH] || !OLSound_Ready()) { if (s_hushed || s_cover) BreathRelease(now, "cover-your-mouth off"); return; }
+    s_mouth = Add(P3(head), QRot(head, V3{ 0.0f, -0.075f, -0.075f }));   // 7.5 cm under and in front of the eyes
+    s_mouthOk = true;
+    const V3 fwd = QRot(head, V3{ 0.0f, 0.0f, -1.0f });
+    s_heavyNow = OLSound_BreathHeavy() != 0 || lm == 8;                   // breathing hard, or hiding in a locker
+    // which free hand is over the mouth (enter 11 cm, leave 16 cm), in front of the face
+    int hand = -1; float best = 9.0f;
+    for (int h = 0; h < 2; ++h) {
+        if (!(fh.valid & (1u << h)) || s_grab[h].d || s_hold[h] || (h == 1 && CamInRightHand())) continue;
+        const V3 p = P3(fh.hand[h]);
+        const float d = Len(Sub(p, s_mouth)), ahead = (p.x - s_headT.x) * fwd.x + (p.y - s_headT.y) * fwd.y + (p.z - s_headT.z) * fwd.z;
+        const float lim = (s_cover && s_coverHand == h) ? 0.16f : 0.11f;
+        if (d < lim && ahead > 0.01f && d < best) { best = d; hand = h; }
+    }
+    if (s_cover && hand < 0) { BreathRelease(now, "hand off the mouth: he lets his breath out"); return; }
+    if (!s_cover && hand >= 0 && s_heavyNow && now >= s_breathCool) {
+        s_cover = true; s_coverHand = hand; s_coverMs = now; s_beatMs = now; s_dubMs = 0;
+        OLSound_Hush(1); s_hushed = true;
+        OLXR_HapticPulse(hand, 0.25f, 30);
+        ILog("[OLVR][BREATH] the %s hand covers his mouth (%.2f m) - holding his breath", hand ? "right" : "left", best);
+    }
+    if (!s_cover) return;
+    if (now - s_coverMs > 12000) { BreathRelease(now, "he could not hold it any longer - a gasp"); s_breathCool = now + 2500; return; }
+    // his heart, in the covering hand: faster the longer he holds it (80 -> 120 bpm)
+    const float held = (float)(now - s_coverMs) * 0.001f, bpm = 80.0f + 40.0f * (held / 12.0f);
+    if (now - s_beatMs >= (ULONGLONG)(60000.0f / bpm)) { s_beatMs = now; s_dubMs = now + 150; OLXR_HapticPulse(s_coverHand, 0.40f, 35); }
+    if (s_dubMs && now >= s_dubMs) { s_dubMs = 0; OLXR_HapticPulse(s_coverHand, 0.22f, 25); }
+}
+static const float kLabelW = 0.13f, kLabelAspect = 512.0f / 160.0f, kLabelLift = 0.075f;
+static void Markers(ULONGLONG now, const OLXrFrameHands& fh) {
+    OLMarker mk[16]; int n = 0;
+    auto add = [&](V3 p, float size, int col, float aspect) {
+        if (n >= 16) return;
+        mk[n].pos[0] = p.x; mk[n].pos[1] = p.y; mk[n].pos[2] = p.z; mk[n].size = size; mk[n].color = col;
+        mk[n].aspect = aspect; ++n;
+    };
+    auto label = [&](V3 at, int which) { add(Add(at, V3{ 0.0f, kLabelLift, 0.0f }), kLabelW, which, kLabelAspect); };
+    const bool lOk = (fh.valid & 1u) != 0, rOk = (fh.valid & 2u) != 0;
+    const V3 L = P3(fh.hand[0]), R = P3(fh.hand[1]);
+    // ---- [HOWTO] ----
+    if (g_on[ON_HOWTO]) {
+        int labels = 0;
+        auto teachLabel = [&](V3 at, int which) { if (labels < 3) { label(at, which); ++labels; } };
+        if (HolsterOn() && s_camUp >= 0) {
+            if (s_hState == H_HOLSTERED) {
+                // where the camcorder is: a glow when your right hand comes near, the label until learned
+                if (rOk && s_dHolster < 0.42f) add(s_holsterVis, s_inHolster ? 0.11f : 0.09f, OLMK_GLOW, 0.0f);
+                // the label floats up in front of your hip, where a glance down finds it; its arrow points at the holster
+                if (Teach(LN_TAKECAM) && rOk && s_dHolster < 0.60f && s_camBlend < 0.01f)
+                    teachLabel(OnBody(kHolsterOff.x, kHolsterOff.y + 0.18f, kHolsterOff.z + 0.18f), OLMK_L_TAKE_CAM);
+            }
+            // "look through it"
+            if (s_hState == H_IN_HAND && s_camUp == 0 && rOk && Teach(LN_RAISE) && s_camBlend > 0.99f)
+                teachLabel(R, OLMK_L_RAISE);
+        }
+        // doors: a hand near a free knob; a locked one says so while it buzzes
+        // [DOOR] no guide ring, square or teach label on a knob: the door is found and opened by hand.
+        //  [RECENTERHINT] Players could not find recenter ("there's no recenter key that I could find").
+        // For the first 25 s of play in each session, until it has been used three times: how to do it, low
+        // in front. A recenter during play counts.
+        {
+            static ULONGLONG s_playSince = 0; static long s_gen = -1;
+            if (!s_playSince && OLUE3_GameplayActive()) s_playSince = now;   // the clock starts with play itself
+            const long gen = OLXR_RecenterGeneration();
+            if (s_gen >= 0 && gen != s_gen) Learn(LN_RECENTER);
+            s_gen = gen;
+            if (s_playSince && now - s_playSince < 25000 && Teach(LN_RECENTER)) {
+                OLXrPose hd = {};
+                if (OLXR_GetFrameHead(&hd)) teachLabel(Add(P3(hd), QRot(hd, V3{ 0.0f, -0.20f, -0.65f })), OLMK_L_RECENTER);
+            }
+        }
+        // (Test43) [BREATH] breathing hard: how to hold it - in front of the face, a little low
+        if (s_mouthOk && s_heavyNow && !s_cover && Teach(LN_BREATH)) {
+            OLXrPose hd = {};
+            if (OLXR_GetFrameHead(&hd)) teachLabel(Add(P3(hd), QRot(hd, V3{ 0.0f, -0.16f, -0.45f })), OLMK_L_COVER_MOUTH);
+        }
+        // (Test40) [CLIMB] a free hand at a climbable edge; holding on (or hanging), how to go up
+        if (g_on[ON_CLIMB]) {
+            if (s_edgeNearOn && s_cl == CL_IDLE) {
+                const V3 ep = WorldToTrack(s_edgeNear);
+                add(ep, 0.05f, OLMK_GLOW, 0.0f);
+                if (Teach(LN_CLIMB) && !(s_hold[0] || s_hold[1])) teachLabel(ep, OLMK_L_CLIMB);
+            }
+            const bool holdingBoth = s_hold[0] && s_hold[1] && s_cl == CL_IDLE;
+            if (Teach(LN_CLIMB) && lOk && rOk && (holdingBoth || s_cl == CL_HANG)) teachLabel(Mul(Add(L, R), 0.5f), OLMK_L_PULL_UP);
+        }
+    }
+    // ---- developer rings ----
+    if (g_on[ON_MARKERS]) {
+        int doorsShown = 0;
+        for (int i = 0; i < s_nearN && doorsShown < 4; ++i) {
+            const NearDoor& nd = s_near[i];
+            if (nd.dist > 250.0f) continue;
+            bool held = (s_grab[0].d == nd.d) || (s_grab[1].d == nd.d);
+            int col = nd.locked ? OLMK_RED : OLMK_GREEN;
+            if (!held && !nd.locked)   // a hand within grab reach of THIS knob: squeeze now
+                for (int h = 0; h < 2; ++h)
+                    if (s_handOk[h] && Len(Sub(s_handW[h], nd.knob)) < kGrabUU) col = OLMK_YELLOW;
+            if (held) col = OLMK_CYAN;
+            else if (nd.locked && s_lockedDoor == nd.d && now < s_lockedFlashUntil) col = ((now / 120) & 1) ? OLMK_RED : OLMK_WHITE;
+            add(WorldToTrack(nd.knob), held ? 0.06f : 0.045f, col, 0.0f);
+            if (held) add(WorldToTrack({ nd.hinge.x, nd.hinge.y, nd.knob.z }), 0.035f, OLMK_WHITE, 0.0f);
+            ++doorsShown;
+        }
+        // raise-to-eye zone: only while the right hand is on its way to your face
+        if (s_dEye < EyeLeave() + 0.10f || (s_camUp == 1 && s_camByGesture)) {
+            const int col = (s_camUp == 1 && s_camByGesture) ? OLMK_GREEN : (s_dEye < EyeEnter() ? OLMK_YELLOW : OLMK_CYAN);
+            add(s_eyeZone, 0.012f, col, 0.0f);   // it sits 11 cm from your eye: keep it small
+        }
+        {
+            if (HolsterOn()) {
+                const int hc = s_hState == H_IN_HAND ? OLMK_GREEN : (s_inHolster ? OLMK_YELLOW : OLMK_CYAN);
+                add(s_holster, 0.06f, hc, 0.0f); add(s_holsterVis, 0.04f, hc, 0.0f);
+                // [BATTERY] the spare cell's left hip (and the held cell, while it is on the hip)
+                const int bc = s_batState != BAT_NONE ? OLMK_GREEN : (s_batInHip ? OLMK_YELLOW : OLMK_CYAN);
+                add(s_batHip, 0.05f, bc, 0.0f); add(s_batHipVis, 0.035f, bc, 0.0f);
+            }
+        }
+    }
+    OLXR_SetMarkers(mk, n);
+}
+
+// ---- [ROOMWALK] (Test44) walk around your room and Miles walks with you ---------------------------------
+// ol_xr's [BODYFOLLOW] drags the position baseline along once your head passes the body bounds (and slides
+// it under a head that settled somewhere new). Before Test44 that drag was dropped: the view stopped at the
+// bound and the body stayed where it was. Now each drag comes here with the very pose it was taken from,
+// and Miles is moved by it through the engine's own swept move (AActor::Move, as [PHYSCLIMB] uses) at the
+// start of the player tick - his body and the view move in the same frame. A wall or a shut door stops him
+// as it stops the stick (the view then waits at the bound, as before); a step up to kRwStepUU is taken the
+// way the game's walk takes it (up, across, down), and a step down his own walk drops him onto next tick.
+// Small leans stay leans: only what goes past the bounds walks.
+static const float kRwStepUU = 30.0f, kRwMaxUU = 40.0f;
+static bool  s_rwOk = false;
+static const char* s_rwWhy = "";
+static float s_rwWant = 0.0f, s_rwGot = 0.0f;
+static int   s_rwSteps = 0;
+static ULONGLONG s_rwLogMs = 0, s_rwStateMs = 0;
+static V3    s_rwAt = { 0, 0, 0 };
+// nullptr: Miles may walk with you now; else why not.
+static const char* RoomWalkWhyNot() {
+    if (!g_on[ON_ROOMWALK]) return "switched off";
+    if (!F.ok) return "the game's fields are not read yet";
+    if (!OLUE3_GetHeadPos()) return "head position is off";
+    if (OLUE3_SceneScripted()) return "a scripted scene or one of the game's own moves has him";
+    int lm = -1, sm = 0;
+    if (!OLUE3_HeroMoveState(&lm, &sm) || lm != 0) return "he is not on his feet (ladder, ledge, door, locker, bed)";
+    if (s_pc || s_cl != CL_IDLE || s_hold[0] || s_hold[1]) return "your hands are climbing";
+    void* hero = OLUE3_Hero(); unsigned char ph = 0xFF;
+    if (!hero || !F.phys || !Rd(hero, F.phys, &ph)) return "no body";
+    if (ph != 1) return "he is off the floor (jumping, falling)";
+    if (!OLUE3_HeroMoveReady()) return "AActor::Move did not verify";
+    return nullptr;
+}
+static float HLen(V3 a, V3 b) { const float x = a.x - b.x, y = a.y - b.y; return sqrtf(x * x + y * y); }
+// Game thread: from the player tick right after the frame latch, and from the interaction tick (no latch).
+extern "C" void OLInteract_RoomWalkStep() {
+    float d[2];
+    if (!OLXR_RoomWalkTake(d)) return;
+    if (!s_rwOk || !OLUE3_GameplayActive() || RoomWalkWhyNot()) return;   // dropped, as before Test44
+    // the recenter frame (x right, z back, metres) into the world by the body yaw the view uses
+    const float f = -d[1] * 100.0f, r = d[0] * 100.0f;
+    V3 w = { s_cy * f - s_sy * r, s_sy * f + s_cy * r, 0.0f };
+    float L = sqrtf(w.x * w.x + w.y * w.y);
+    if (!(L > 0.01f)) return;
+    if (L > kRwMaxUU) { w = Mul(w, kRwMaxUU / L); L = kRwMaxUU; }        // a hitch's worth at most
+    void* hero = OLUE3_Hero(); V3 B0;
+    if (!hero || !Rd(hero, F.loc, &B0) || !Finite3(B0)) return;
+    float nb[3];
+    if (!OLUE3_HeroMove(&w.x, nb)) return;
+    V3 B = { nb[0], nb[1], nb[2] };
+    float got = HLen(B, B0);
+    if (got < L * 0.6f && L > 0.25f) {
+        // held back: a stair, a threshold? up, across, back down - the way the game's walk steps
+        const V3 up = { 0.0f, 0.0f, kRwStepUU }, rest = Mul(w, 1.0f - got / L);
+        float a[3] = { B.x, B.y, B.z }, b[3] = { 0, 0, 0 }, c[3] = { 0, 0, 0 };
+        if (OLUE3_HeroMove(&up.x, a) && OLUE3_HeroMove(&rest.x, b)) {
+            const V3 down = { 0.0f, 0.0f, -((a[2] - B.z) + 4.0f) };
+            if (OLUE3_HeroMove(&down.x, c)) {
+                const V3 S = { c[0], c[1], c[2] };
+                const float g2 = HLen(S, B0);
+                if (g2 > got + 0.1f && S.z > B.z + 1.0f) ++s_rwSteps;
+                if (g2 > got) got = g2;
+                B = S;
+            }
+        }
+    }
+    s_rwWant += L; s_rwGot += got; s_rwAt = B;
+}
+static void RoomWalkTick(ULONGLONG now) {
+    const char* why = RoomWalkWhyNot();
+    const bool ok = !why;
+    if ((ok != s_rwOk || (why && strcmp(why, s_rwWhy) != 0)) && now - s_rwStateMs > 1500) {
+        s_rwStateMs = now;
+        if (ok) ILog("[OLVR][ROOMWALK] on: walking around your room walks Miles (past %s)", s_rwWhy[0] ? s_rwWhy : "start");
+        else ILog("[OLVR][ROOMWALK] paused: %s - your steps only lean the view", why);
+        s_rwWhy = why ? why : "";
+    }
+    s_rwOk = ok;
+    OLXR_RoomWalkAllow(ok ? 1 : 0);
+    OLInteract_RoomWalkStep();          // without the frame latch the step happens here
+    if (s_rwWant > 0.5f && now - s_rwLogMs > 3000) {
+        s_rwLogMs = now;
+        ILog("[OLVR][ROOMWALK] you walked %.0f cm in your room - Miles walked %.0f cm with you (%.0f cm held back by walls, %d step%s up), now at (%.0f %.0f %.0f)",
+             s_rwWant, s_rwGot, s_rwWant - s_rwGot > 0.0f ? s_rwWant - s_rwGot : 0.0f, s_rwSteps, s_rwSteps == 1 ? "" : "s", s_rwAt.x, s_rwAt.y, s_rwAt.z);
+        s_rwWant = s_rwGot = 0.0f; s_rwSteps = 0;
+    }
+}
+
+// ---- the tick ---------------------------------------------------------------------------------------
+extern "C" void OLInteract_Tick() {
+    const ULONGLONG now = GetTickCount64();
+    if (!OLUE3_GameplayActive() || !Resolve()) {
+        OLProxy_SetHandleY(0);   // [RELOAD] no gameplay: let the game see Y again
+        if (!OLUE3_GameplayActive()) s_camUp = -1;   // (V1) not sampled now: the arm solver waits before freezing a reference
+        // (Test43) a hand-carried climb rides out a moment of this (a hitch, a blink): the pad merge lets
+        // go of him only after 1.5 s - zeroing the tick here dropped Miles off a ladder twice in testing
+        if (s_pc) { static ULONGLONG s_offLog = 0; if (now - s_offLog > 2000) { s_offLog = now; ILog("[OLVR][PHYSCLIMB] gameplay check off for a moment while climbing - holding on"); } }
+        else s_tickMs = 0;
+        CamcorderHudTick(false);
+        s_rwOk = false; OLXR_RoomWalkAllow(0);
+        OLXR_SetMarkers(nullptr, 0); return;
+    }
+    OLUE3_ObjScanStep();                  // (Test45) [OBJSCAN] doors, ledges, ladders: a slice a frame
+    void* hero = OLUE3_Hero(); void* pc = OLUE3_PlayerController();
+    unsigned char cs = 0; float z = 0.0f, en = 1.0f; int nb = 0;
+    s_camRaw = Rd(hero, F.camState, &cs) ? (int)cs : -1;
+    s_camUp = s_camRaw >= 0 ? (s_camRaw == 1 ? 1 : 0) : -1;
+    // (V1) Some saves/levels begin with the camcorder already at Miles's face. The game poses his
+    // right arm from that very first frame, and the arm solver freezes the pose it finds as its
+    // reference - a camcorder there at startup leaves the VR right hand stuck wrong for the whole
+    // session. For the first seconds of each pawn, whenever the camcorder is up, ask the game's
+    // own toggle to lower it (never write CamcorderState directly: that desyncs the property from
+    // the game's real state and makes the next R3 raise it instead of lowering it). The guard ends
+    // early only when the camcorder has stayed down for a moment, or when the player takes over.
+    if (hero != s_camGuardHero) {
+        s_camGuardHero = hero; s_camStarted = false; s_camGuardTicks = 0; s_camStartLogged = false;
+        s_camDownSince = 0; s_camStartToggleAt = 0; s_camSawUp = false;
+    }
+    if (!s_camStarted) {
+        ++s_camGuardTicks;
+        if (s_camUp == 1 && s_camGuardTicks <= kCamGuardTicks) {
+            s_camSawUp = true;                        // it really was up at startup
+            s_camDownSince = 0;
+            if (now > s_camStartToggleAt) {            // the game's own lower (RB = OLA_ToggleCamcorder)
+                s_camStartToggleAt = now + 900;
+                RequestCamToggle(now, 150);
+                if (!s_camStartLogged) {
+                    s_camStartLogged = true;
+                    ILog("[OLVR][FACECAM] gameplay began with the camcorder at his face - lowering it with the game's own toggle (startup guard)");
+                }
+            }
+        } else if (s_camUp == 0) {
+            if (!s_camDownSince) s_camDownSince = now;
+            //  The long settle is only needed when the game's own raise is on its way
+            // down. If it was never up, there is nothing to wait for: the reference pose can be
+            // captured at once, so the arms are there from the first moments of the level.
+            const ULONGLONG settle = s_camSawUp ? kCamGuardSettleMs : kCamGuardStartMs;
+            if (now - s_camDownSince >= settle) s_camStarted = true;
+        }
+        if (s_camGuardTicks > kCamGuardTicks) s_camStarted = true;   // give up: the pin below takes over
+        if (s_camByGesture || s_rsDown || s_hState == H_IN_HAND ||
+            s_facePending || s_faceLowering) s_camStarted = true;      // the player is using it
+    }
+    //  [FACECAM] The game's own camcorder state is the truth: a raise lands the pin,
+    // a lower (ours, the game's, a reload, a cutscene) releases it.
+    if (s_facePending && s_camUp == 1) {
+        s_facePending = false; s_faceLock = true; s_faceLowering = false;
+        OLXR_HapticPulse(1, 0.5f, 40);
+        ILog("[OLVR][FACECAM] the camcorder is at his face - it stays there with your hand resting");
+    } else if (s_facePending && now - s_facePendingAt > 3000) {
+        s_facePending = false;
+        ILog("[OLVR][FACECAM] the game did not raise the camcorder - the face pin was dropped");
+    }
+    if (s_faceLowering && s_camUp == 1 && now - s_faceLowerAt > 5000) {
+        s_faceLowering = false;
+        ILog("[OLVR][FACECAM] the game did not lower the camcorder - the face pin stays; try again");
+    }
+    //  THE LOWER ANIMATION IS NOT OVER WHEN THE STATE FLIPS.
+    // CamcorderState drops to 0 the moment the game starts lowering, but the game's arm keeps playing
+    // its lower pose for most of a second after that. Releasing the pin on the state change handed the
+    // right arm back to the IK solver immediately, so the animation was overwritten before it could be
+    // seen - the report "the animation is not shown". The lowering flag now lives for the animation's
+    // own dwell (kFaceLowerAnimMs), so the game's arm plays it out before the controller takes over.
+    if (s_faceLowering && s_camUp == 0) {
+        const ULONGLONG since = now - s_faceLowerAt;
+        if (since >= kFaceLowerAnimMs) {
+            s_faceLock = false; s_faceLowering = false; s_facePending = false;
+            ILog("[OLVR][FACECAM] the lower animation finished (%.0f ms) - face pin released", (double)since);
+        } else {
+            return;      // hold the arm with the game for the rest of its animation
+        }
+    }
+    if (s_camUp == 0 && s_faceLock) {
+        s_faceLock = false; s_faceLowering = false; s_facePending = false;
+        // The camcorder came off Miles's face via the game's lower animation. Leave it in the
+        // normal holster path (hip) unless the player physically grabs it with the right grip.
+        ILog("[OLVR][FACECAM] the camcorder is down - face pin released");
+    }
+    // (V1) The game raised the camcorder by itself (a script, or a save that began at his face):
+    // adopt the face pin. His own arm then plays the raise pose instead of the empty controller
+    // hand, the camcorder can be grabbed at his face, and ONE held right-stick click lowers it -
+    // without the pin that first click only "fixed" it and a second was needed to lower it.
+    // [FACECAM] ...but never while the player is HOLDING it in the hand. The physical grab asks
+    // the game to lower it; until that lands (a frame or two) the state still reads 1, and adopting
+    // it here put the camera straight back at his face and hid it - the grab looked impossible.
+    if (s_camStarted && s_camUp == 1 && !s_faceLock && !s_facePending && !s_faceLowering &&
+        !s_camByGesture && s_hState != H_IN_HAND) {
+        s_faceLock = true;
+        ILog("[OLVR][FACECAM] the game raised the camcorder by itself - pinned at his face");
+    }
+    const bool zoomRead = Rd(hero, F.zoom, &z), energyRead = Rd(hero, F.energy, &en);
+    const bool sparesRead = Rd(pc, F.numBat, &nb);
+    s_zoom = zoomRead ? z : 0.0f;
+    s_energy = energyRead ? en : 1.0f;
+    s_numBat = sparesRead ? nb : 0;
+    CamcorderHudTick(s_camUp >= 0 && zoomRead && energyRead && sparesRead &&
+        std::isfinite(z) && std::isfinite(en));
+    // [CAMHUD] "the W-T bar does not move" is answered by the log either way: one line every
+    // quarter second while the zoom is actually changing shows whether the game's own factor
+    // moves and where the thumb lands.
+    if (s_camUp == 1 && zoomRead) {
+        static float s_zoomLogged = -1.0f; static ULONGLONG s_zoomLogMs = 0;
+        if (std::fabs(z - s_zoomLogged) > 0.02f && now - s_zoomLogMs > 250) {
+            s_zoomLogged = z; s_zoomLogMs = now;
+            ILog("[OLVR][CAMHUD] zoom %.6g -> W-T thumb %.0f%% of the lever", z, OLCamHud::ZoomUnit(z) * 100.0f);
+        }
+    }
+    // [VIEWFINDER] engage past a small zoom, release just above zero (hysteresis)
+    {
+        const bool on = g_on[ON_VIEWFINDER] && s_camUp == 1 && (s_vfZoom > 0.0f ? s_zoom > 0.01f : s_zoom > 0.03f);
+        s_vfZoom = on ? (s_zoom < 1.0f ? s_zoom : 1.0f) : 0.0f;
+        s_vfMs = now;
+    }
+    float hw[3] = {}, yaw = 0.0f;
+    OLXrFrameHands fh = {}; OLXrPose head = {}; OLXrPad p = {};
+    if (!OLUE3_FrameView(hw, &yaw) || !OLXR_GetFrameHands(&fh) || !OLXR_GetFrameHead(&head) || !OLXR_GetPad(&p)) {
+        s_tickMs = 0; s_rwOk = false; OLXR_RoomWalkAllow(0); OLXR_SetMarkers(nullptr, 0); return;
+    }
+    s_headW = { hw[0], hw[1], hw[2] }; s_cy = cosf(yaw); s_sy = sinf(yaw);
+    s_headT = { fh.headRaw[0], fh.headRaw[1], fh.headRaw[2] };
+    s_headFwd = QRot(head, V3{ 0.0f, 0.0f, -1.0f });   // [DOCUMENT] the head's forward, for "look at it"
+    TorsoUpdate(head);
+    // grips with hysteresis, and their press edges
+    const float g[2] = { p.gripL, p.gripR };
+    for (int h = 0; h < 2; ++h) {
+        const bool down = s_gripDown[h] ? g[h] > 0.35f : g[h] > 0.60f;
+        s_gripEdge[h] = down && !s_gripDown[h];
+        s_gripDown[h] = down;
+    }
+    V3 handW[2]; bool handOk[2];
+    for (int h = 0; h < 2; ++h) {
+        handOk[h] = (fh.valid & (1u << h)) != 0;
+        handW[h] = handOk[h] ? TrackToWorld(P3(fh.hand[h])) : V3{ 0, 0, 0 };
+    }
+    s_handW[0] = handW[0]; s_handW[1] = handW[1]; s_handOk[0] = handOk[0]; s_handOk[1] = handOk[1];
+    static ULONGLONG s_lastTick = 0;
+    float dt = s_lastTick ? (float)(now - s_lastTick) * 0.001f : 0.014f; s_lastTick = now;
+    if (dt < 0.002f) dt = 0.002f; if (dt > 0.05f) dt = 0.05f;
+    CamHoldGesture(now, p);      //  [FACECAM] a held right stick click: raise / pin / lower
+    Holster(now, fh);           // first: a squeeze at the hip is the camcorder's, not a door's
+    CamRaise(now, head, fh);
+    OLProxy_SetHandleY(s_camUp == 1 ? 1 : 0);   // [RELOAD] at the face the mod owns Y (lower, then reload)
+    YReload(now, p);            // [RELOAD] Y reloads the camcorder even while it is merely held
+    // [BATTERY] a queued menu "Preview": start the animation on the game thread (never the render thread).
+    if (InterlockedExchange(&s_batPreviewReq, 0) && !s_batReloading) {
+        const float dur = OLUE3_BeginBatteryReload(1);
+        if (dur > 0.05f) {
+            s_batReloading = true; s_batPreview = true;
+            s_batReloadAt = now; s_batReloadDur = dur + 0.05f;
+            s_batHero = OLUE3_Hero();
+            ILog("[OLVR][BATTERY] previewing the reload animation (%.2fs)", dur);
+        }
+    }
+    Battery(now, dt, fh, p);    // [BATTERY] left hip, left hand, and the reload animation
+    Document(now, dt, fh, p);   // [DOCUMENT] the confidential document on the left shoulder
+    Climb(now, dt, fh, handW, handOk);   // (Test40) a squeeze on a climbable edge holds the edge
+    RoomWalkTick(now);                    // (Test44) after Climb: it knows whether the hands are climbing
+    Doors(now, dt, handW, handOk, fh);
+    Breath(now, head, fh, s_lm);          // (Test43) a hand over the mouth while he breathes hard
+    HandNV(now, p, hero);                 // (Test43) night vision on the camcorder in your hand
+    if (OLSound_Ready()) OLSound_Report(); // (Test43) [AUDIODIAG] every 10 s - (Test46) only with the sound hooks in
+    {   // [ANCHOR] (Test40) where each hand holds on this frame: an edge (climbing), a handle, a panel
+        for (int h = 0; h < 2; ++h) {
+            bool on = false;
+            if (s_hold[h] && (s_cl == CL_IDLE || s_cl == CL_PULLING)) { s_anchorW[h] = s_holdW[h]; on = true; }
+            else if (s_doorAnchorOn[h]) {
+                // [DOOR] THE HAND STAYS ON THE HANDLE WHILE THE GRIP IS CLOSED.
+                // This used to follow the knob for the first ~300 ms of the grab and then release the
+                // anchor "so the door swings through the hand" - which is what let the player pull the
+                // hand away from the knob and leave the door behind while still squeezing it. A hand
+                // closed round a handle cannot leave it: while the grip is down the anchor holds, so
+                // the hand rides the knob as the door swings, and only opening the grip, the door being
+                // taken by the game, or the knob going out of the arm's reach ends the grab (see the
+                // let-go checks in Doors(); the two-bone solve still enforces the real arm reach).
+                // [DOOR] ...and the point it follows is the one the door tick refreshed, so the
+                // hand is pulled to where the knob is NOW, not to where it was when the grab landed.
+                if (s_gripDown[h] || (now - s_doorAnchorMs[h]) < 300) { s_anchorW[h] = s_doorAnchor[h]; on = true; }
+            }
+            // [DOOR] SNAP ONTO THE HANDLE, AND SNAP OFF IT.
+            // "The magnet works, but it takes too long - it should be nearly instant", and "shorten the
+            // time the hand stays stuck to the handle after I release the grip".
+            // ON: while the grip is closed the weight is re-asserted at 1 every frame, so the grab lands
+            // on its own frames and no missed door tick can decay it. A grab also sets it to 1 outright.
+            // OFF: this hand let go of a knob and is not holding a ledge, so there is nothing left to
+            // follow - the anchor is released AT ONCE instead of decaying over ~0.5 s with the hand
+            // still stuck to the handle. The eased ramp is kept only for the other cases (a ledge, an
+            // open hand pushing a panel), where the hand is still where it should be.
+            const bool heldKnob = s_doorAnchorOn[h] && s_grab[h].d && s_gripDown[h];
+            const bool letKnob = s_doorLetGoKnob[h];
+            if (heldKnob) {
+                s_anchorWt[h] = 1.0f;
+            } else if (letKnob) {
+                s_anchorWt[h] = 0.0f; s_doorLetGoKnob[h] = false;
+            } else {
+                const float rate = on ? 18.0f : 9.0f;
+                s_anchorWt[h] += ((on ? 1.0f : 0.0f) - s_anchorWt[h]) * (1.0f - expf(-rate * dt));
+            }
+            if (!on && s_anchorWt[h] < 0.01f) s_anchorWt[h] = 0.0f;
+            if (s_gripDown[h] || s_hold[h]) s_doorLetGoKnob[h] = false;   // a new hold cancels a stale one
+        }
+        static ULONGLONG s_chkMs = 0; float cb[3];
+        if (now - s_chkMs > 30000 && OLUE3_CameraBoneWorld(cb)) {
+            s_chkMs = now;
+            ILog("[OLVR][ANCHOR] view centre vs Miles's camera bone in the world: %+.1f %+.1f %+.1f uu", s_headW.x - cb[0], s_headW.y - cb[1], s_headW.z - cb[2]);
+        }
+    }
+    {   // [DOORGRIP] the hand closes round the handle in ~0.12 s and opens in ~0.18 s
+        for (int h = 0; h < 2; ++h) {
+            // The document does not clench the hand: it stays in its normal pose (following the
+            // controller) while the grip is held, so the document can be tuned to sit over it.
+            const float target = (s_grab[h].d || (s_hold[h] && (s_cl == CL_IDLE || s_cl == CL_PULLING)) ||
+                                  (h == 0 && s_batState != BAT_NONE)) ? 1.0f : 0.0f;
+            const float rate = target > s_gripW[h] ? 8.0f : 5.5f;
+            // Settle exactly at the target (the old +/- step overshot and oscillated around 1.0,
+            // which made a held hand tremble).
+            const float dir = target > s_gripW[h] ? 1.0f : (target < s_gripW[h] ? -1.0f : 0.0f);
+            s_gripW[h] += dir * rate * dt;
+            if (s_gripW[h] < 0.0f) s_gripW[h] = 0.0f; if (s_gripW[h] > 1.0f) s_gripW[h] = 1.0f;
+        }
+    }
+    // A grip that is on a knob is not sprint/camcorder.
+    s_blockGrip[0] = s_grab[0].d || s_nearKnob[0] || s_batState != BAT_NONE || s_batReloading || s_docState != DOC_NONE;
+    s_blockGrip[1] = HolsterOn() || s_grab[1].d || s_nearKnob[1] || (!g_camButton && s_nearDoorWide[1]) || s_batReloading;
+    // (Test40) [CLIMB] a grip holding an edge, a ledge or a rung is not sprint / the camcorder
+    for (int h = 0; h < 2; ++h) if (g_on[ON_CLIMB] && (s_hold[h] || s_cl == CL_HANG || s_cl == CL_LADDER || s_cl == CL_CLIMBING)) s_blockGrip[h] = true;
+    Markers(now, fh);
+    s_tickMs = now;
+    static ULONGLONG s_knobLogMs = 0;
+    if (s_nearN > 0 && now - s_knobLogMs > 3000) {
+        // where to reach: the nearest knob relative to the head (recenter frame, metres)
+        s_knobLogMs = now;
+        const V3 k = Sub(WorldToTrack(s_near[0].knob), s_headT);
+        ILog("[OLVR][INTERACT] nearest knob %.2f m away at head%+.2f %+.2f %+.2f (x right, y up, z back) ratio %.2f%s",
+             s_near[0].dist * 0.01f, k.x, k.y, k.z, s_near[0].ratio, s_near[0].locked ? " LOCKED" : "");
+    }
+    static ULONGLONG s_logMs = 0;
+    if (now - s_logMs > 10000) {
+        s_logMs = now;
+        const V3 hr = Sub(s_holster, s_headT), hvr = Sub(s_holsterVis, s_headT);
+        int live = 0; for (const DoorSim& s : s_sim) if (s.live) ++live;
+        // the right controller's angle relative to the head (how real hands hold it: for the camcorder grip)
+        const OLXrPose& rq = fh.hand[1];
+        const V3 rf = QRot(rq, V3{ 0.0f, 0.0f, -1.0f }), ru = QRot(rq, V3{ 0.0f, 1.0f, 0.0f });
+        ILog("[OLVR][INTERACT] alive: cam=%d zoom=%.2f vf=%.2f batteries=%d energy=%.2f | holster %s blend %.2f (reach head%+.2f %+.2f %+.2f, drawn head%+.2f %+.2f %+.2f, hand %.2f m) "
+             "slot | doors %d/%d (moving %d) | climb %s%s (move %d/%d, edges %d) | eye %.2f m | right grip fwd (%+.2f %+.2f %+.2f) up (%+.2f %+.2f %+.2f) | breath %s",
+             s_camUp, s_zoom, (float)s_vfZoom, s_numBat, s_energy, s_hState == H_IN_HAND ? "IN HAND" : "holstered", s_camBlend,
+             hr.x, hr.y, hr.z, hvr.x, hvr.y, hvr.z, s_dHolster, s_nearN, s_allN, live,
+             kClName[s_cl], s_pc ? " (carried by the hands)" : "", s_lm, s_sm, s_ledgeN, s_dEye, rf.x, rf.y, rf.z, ru.x, ru.y, ru.z,
+             s_cover ? "HELD" : (s_heavyNow ? "heavy" : "calm"));
+    }
+}
+
+extern "C" void OLInteract_Pad(const OLXrPad& p, OLInteractPad* out) {
+    if (!out) return;
+    out->addButtons = 0; out->removeButtons = 0; out->blockGripL = out->blockGripR = false; out->camUp = -1;
+    const ULONGLONG now = GetTickCount64();
+    // A grip that went to a knob, a battery or the pouch stays the mod's until the hand actually
+    // opens - whatever happens to the tick in between. Unblocking a grip that is still closed made
+    // the game see a fresh press and toggle the camcorder (seen in testing). The other way round
+    // too: a grip the game already has (sprint on the left grip) stays the game's while the hand
+    // passes a knob or the pouch, so running through a doorway does not drop the sprint. Only a
+    // grab or a battery - both start on a fresh squeeze - takes a held grip over.
+    static bool s_sticky[2] = { false, false }, s_gameHas[2] = { false, false };
+    const float g[2] = { p.gripL, p.gripR };
+    const bool fresh = s_tickMs && now - s_tickMs <= 250;
+    for (int h = 0; h < 2; ++h) {
+        if (g[h] < 0.35f) { s_sticky[h] = false; s_gameHas[h] = false; }
+        const bool owns = s_grab[h].d || (h == 1 && s_hState == H_IN_HAND) ||
+            (h == 0 && (s_batState != BAT_NONE || s_batReloading || s_docState != DOC_NONE)) ||
+            (s_batReloading && h == 1) || (g_on[ON_CLIMB] && s_hold[h]);
+        if (fresh && (owns || (s_blockGrip[h] && !s_gameHas[h]))) s_sticky[h] = true;
+        if (!s_sticky[h] && g[h] > 0.60f) s_gameHas[h] = true;
+    }
+    out->blockGripL = s_sticky[0];
+    out->blockGripR = s_sticky[1];
+    if (!fresh && s_pc && s_tickMs && now - s_tickMs <= 1500 && !OLUE3_InGameMenu()) return;   // (Test43) a hitch mid-climb: hold on
+    if (!fresh) {
+        // The tick stopped (menu, cutscene, loading): nothing of ours may act or stay on screen.
+        static ULONGLONG s_cleared = 0;
+        if (s_cleared != s_tickMs) { OLXR_SetMarkers(nullptr, 0); s_cleared = s_tickMs; }
+        for (int h = 0; h < 2; ++h) if (s_grab[h].d) {
+            ILog("[OLVR][INTERACT] door let go by the %s hand (interactions paused)", h ? "right" : "left");
+            s_grab[h].d = nullptr;
+        }
+        if (s_pc) PcStop("interactions paused (menu, cutscene, loading)", false);   // (Test43)
+        if (s_hushed || s_cover) BreathRelease(now, "interactions paused");
+        if (s_cl != CL_IDLE || s_hold[0] || s_hold[1]) { s_cl = CL_IDLE; ClearHolds(); }
+        if (s_paceWritten != 1.0f) { OLUE3_SetHeroAnimRate(1.0f); s_paceWritten = 1.0f; s_paceRate = 1.0f; }
+        s_blockOn = false;
+        for (DoorSim& s : s_sim) s.live = false;
+        s_anchorWt[0] = s_anchorWt[1] = 0.0f;
+        return;
+    }
+    out->camUp = s_camUp;
+    if (now < s_camPulseUntil) out->addButtons |= 0x0200;   // RB = OLA_ToggleCamcorder
+    if (now < s_nvPulseUntil)  out->addButtons |= 0x0080;   // (Test43) R3 = OLA_ToggleNightVision ([HANDNV] sync)
+    if (now < s_reloadUntil)   out->addButtons |= 0x8000;   // Y  = OLA_Reload
+    if (now < s_aUntil && now >= s_aFrom) out->addButtons |= 0x1000;   // (Test40) A = OLA_Jump: climb (up)
+    if (now < s_bUntil)        out->addButtons |= 0x2000;   // (Test40) B = OLA_CrouchToggle: drop from a ledge
+    if (now < s_docMenuPulseUntil) out->addButtons |= 0x0008;   // [DOCUMENT] D-pad right = OLA_ShowEvidenceMenu (documents)
+    out->stickOn = false; out->stickLX = 0.0f; out->stickLY = 0.0f;
+    if (g_on[ON_CLIMB] && s_cl == CL_LADDER && s_ladderStickOn) { out->stickOn = true; out->stickLY = s_ladderStick; }
+    else if (now < s_stepUntil) { out->stickOn = true; out->stickLX = s_stepX; out->stickLY = s_stepY; }
+    //  PHYSICAL: the jump button never finishes a climb - the hands do. A still jumps at a
+    // higher ledge (Miles grabs it with his left hand himself, [CLIMBGRAB]); the crouch button still drops
+    // him. Hybrid and the A button leave A to the game.
+    if (ClimbEatsJump(g_climbMode, s_pc, s_pcOnLadder, s_hold[0] || s_hold[1], s_lm)) {
+        out->removeButtons |= 0x1000;
+        static ULONGLONG s_eatLog = 0;
+        if (now - s_eatLog > 4000) {
+            s_eatLog = now;
+            ILog("[OLVR][PHYSCLIMB] physical climbing: A does not finish the climb - the hands do (%s); "
+                 "letting go or crouch still drops him", s_pc && !s_pcOnLadder ? "carried by your hands" : "hanging");
+        }
+    }
+}
+
+extern "C" float OLInteract_ViewfinderZoom() {
+    if (!s_vfMs || GetTickCount64() - s_vfMs > 250) return 0.0f;
+    return s_vfZoom;
+}
+// While the camcorder is up and the right hand is at the eye - or it is pinned at his face by a
+// held right stick click - the right arm is the game's.
+// (V1) while Miles's own arm plays the camcorder at his face - pinned, or while the game is
+// raising/lowering it - the controller hand must not override his animation.
+extern "C" int OLInteract_RightArmNative() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    if (HolsterOn() && s_hState != H_IN_HAND && !s_faceLock && !s_facePending && !s_faceLowering)
+        return 0;
+    if (s_faceLock || s_facePending || s_faceLowering) return 1;
+    // [FACECAM] A camera physically held in the hand is the CONTROLLER's arm, never the game's: while
+    // s_hState is H_IN_HAND Miles must not keep his own "camcorder at the face" pose, or taking it off
+    // his face has no visible effect. Otherwise this is the old/ rule: the game's own raise / lower
+    // animation owns the arm, and the hand-at-the-eye pose is the tucked one.
+    if (s_hState == H_IN_HAND) return 0;
+    return (s_camUp == 1 && s_dEye < EyeLeave() + 0.05f) ? 1 : 0;
+}
+extern "C" int OLInteract_FaceCamPinned() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    return (s_camUp == 1 && s_faceLock) ? 1 : 0;
+}
+//  A FRESH PHYSICAL GRAB MUST NOT EASE IN.
+// The right hand's target is smoothed (`follow = 0.45 + 0.55 * error/25`), which is what makes the
+// arm feel natural - but for the frame or two after the camcorder is taken off the face it made the
+// grab itself feel late: the object was in the hand while the hand was still travelling. The solver
+// asks this once per grab and starts from the controller's actual pose instead of easing.
+// (V1) The camcorder state as the arm solver needs it: 1 at Miles's face, 0 down, -1 before the
+// first gameplay tick has sampled it. The solver must not freeze Miles's reference pose while it
+// is up (the game poses his right arm from that frame), so it waits for a 0 here.
+extern "C" int OLInteract_CamUpKnown() {
+    const ULONGLONG now = GetTickCount64();
+    if (!s_tickMs || now - s_tickMs > 250) return -1;
+    return s_camUp;
+}
+// (V1) Is it safe for the arm solver to freeze Miles's reference pose yet? Only after the startup
+// camcorder guard has finished (the camera stayed down) - capturing it during the game's own lower
+// animation/first frames is what left the VR right hand twisted behind his back.
+extern "C" int OLInteract_PoseRefReady() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    return (s_camStarted && s_camUp == 0) ? 1 : 0;
+}
+extern "C" int OLInteract_FaceCamBusy() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    // The game's own lower animation drives the right arm only for a face lower (R3) or a Y reload at
+    // the face - never for physically taking the camcorder off the face, which stays on the controller.
+    return (s_faceLock || s_facePending || s_faceLowering || s_yWaitLower) ? 1 : 0;
+}
+//  The camcorder is physically held in the hand at Miles's face: hide the hand so only
+// the camera screen shows.
+//  ...but ONLY while it really is up at the eye. This used to answer 1 for as long as the
+// game's CamcorderState lagged at 1, which is exactly the frames after a physical grab off his face - so
+// the controller hand was thrown away and Miles's native "camera at the face" arm pose stood for those
+// frames: it read as the camera dipping / lowering before it appeared in the hand. A camera held away
+// from the eye is in the hand, and the hand is the controller's.
+extern "C" int OLInteract_CamInHandAtFace() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    if (s_hState != H_IN_HAND) return 0;
+    // Two ways a hand-held camera is still "at the face": the game's own CamcorderState is up and
+    // the camera is inside the eye zone, or the player physically took it off his face and has not
+    // carried it out of the zone yet. The second case is s_camGrabbedAtFace - the game's state lags
+    // for frames after a grab, and in those frames the empty open hand was drawn beside the lens.
+    if (s_camUp == 1 && s_dEye < EyeLeave()) return 1;
+    return s_camGrabbedAtFace ? 1 : 0;
+}
+//  Is the startup camcorder guard over? (used by the arm solver's diagnostic log)
+extern "C" int OLInteract_CamStarted() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    return s_camStarted ? 1 : 0;
+}
+// [ANCHOR] (Test40) the world point a hand holds (an edge, a handle, the panel it pushes) and how much// (eased 0..1); ol_ue3's arm solve reaches there instead of the controller. Game thread.
+// [AIMASSIST] (phase 8) The nearest door knob the player is already looking roughly at, so the
+// interaction ray can be bent the last few degrees onto it. Doors only, deliberately: they are the
+// reported case (a narrow edge, a small handle), they are already scanned every frame, and every one
+// in range is one the game itself offers. Returning 0 for everything else keeps the assist from
+// grabbing pickups or scripted objects that have their own, tighter rules.
+extern "C" int OLInteract_AimAssistTarget(const float headWorld[3], const float fwd[3],
+                                          float maxDistUU, float coneDeg, float out[3]) {
+    if (!headWorld || !fwd || !out) return 0;
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    if (!(coneDeg > 0.0f) || s_nearN <= 0) return 0;
+    const float cosCone = cosf(coneDeg * 0.0174532925f);
+    float best = -1.0f, bestD = 1e9f;
+    for (int i = 0; i < s_nearN; ++i) {
+        if (s_near[i].busy || s_near[i].cant) continue;
+        const float dx = s_near[i].knob.x - headWorld[0];
+        const float dy = s_near[i].knob.y - headWorld[1];
+        const float dz = s_near[i].knob.z - headWorld[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (!(d2 > 1.0f)) continue;
+        const float d = sqrtf(d2);
+        if (d > maxDistUU) continue;
+        // the knob must already be inside the cone: this is what keeps a near miss out
+        if ((dx * fwd[0] + dy * fwd[1] + dz * fwd[2]) / d < cosCone) continue;
+        if (d < bestD) { bestD = d; best = (float)i; }
+    }
+    if (best < 0.0f) return 0;
+    const NearDoor& nd = s_near[(int)best];
+    out[0] = nd.knob.x; out[1] = nd.knob.y; out[2] = nd.knob.z;
+    return 1;
+}
+extern "C" float OLInteract_HandAnchorWorld(int h, float out[3]) {    if (h < 0 || h > 1 || !s_tickMs || GetTickCount64() - s_tickMs > 250 || s_anchorWt[h] <= 0.0f) return 0.0f;
+    out[0] = s_anchorW[h].x; out[1] = s_anchorW[h].y; out[2] = s_anchorW[h].z;
+    const float w = s_anchorWt[h];
+    return w * w * (3.0f - 2.0f * w);
+}
+// [DOOR] while a hand holds a knob its wrist is pinned to the door: it turns with the swing instead of
+// following the controller, so the hand never looks twisted against the handle. 1 = locked this frame.
+extern "C" int OLInteract_HandAnchorLock(int h) {
+    if (h < 0 || h > 1 || !s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    return (s_grab[h].d && s_grabFixed[h] && s_anchorLock[h]) ? 1 : 0;
+}
+//  [DOOR] this hand is holding a door KNOB right now (a grip closed on a handle, not an open
+// hand pushing the panel and not a ledge or a rung). The arm solver snaps its ramp for it, so the hand
+// is on the handle from the grab frame instead of easing in - "the magnet takes too long".
+extern "C" int OLInteract_HandAnchorKnob(int h) {
+    if (h < 0 || h > 1 || !s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    return (s_grab[h].d && s_grabFixed[h] && s_doorAnchorOn[h]) ? 1 : 0;
+}
+// [DOOR] how far the door has swung since the grab (deg); the wrist takes this on top of the pose it had.
+extern "C" float OLInteract_HandAnchorYaw(int h) {
+    if (h < 0 || h > 1) return 0.0f;
+    return s_anchorYaw[h];
+}
+// [DOORPALM] while an open hand pushes a door: the world point on the panel, the direction into the
+// [CLIMB] (Test40) In a climb, ledge hang or on a ladder: this hand holds on (it plays the game's arm).
+//  PHYSICAL: the left hand's auto-catch plays the game's grab pose from the jump on (PhysAutoCatch),
+// and a hand that holds a rung or the ledge does too. A released hand goes back to the tracked, open hand.
+extern "C" int OLInteract_ClimbHold(int h) {
+    if (h < 0 || h > 1 || !s_tickMs || GetTickCount64() - s_tickMs > 250 || !g_on[ON_CLIMB]) return 0;
+    //  PHYSICAL: going down a ladder is the game's own descent animation - both arms are its,
+    // even the hand that let go of its rung, so the descent plays exactly as the game made it.
+    if (ClimbIsPhysicalLike(g_climbMode) && s_cl == CL_LADDER && GetTickCount64() < s_ladderDownUntil) return 1;
+    const bool guided = s_cl == CL_CLIMBING || s_cl == CL_HANG || s_cl == CL_LADDER;
+    const bool physical = ClimbIsPhysicalLike(g_climbMode) && s_pcAuto[h];
+    return ClimbHoldPlaysGameArm(guided ? 1 : 0, physical) && s_hold[h] ? 1 : 0;
+}
+// [CLIMBFINISH]  PHYSICAL: the hands lifted Miles to the top and the game was asked to play its
+// own climb from there. 1 while that is happening, so ol_ue3 leaves both arms to the game (its animation).
+extern "C" int OLInteract_ClimbFinishing() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    return s_pcFinish ? 1 : 0;
+}
+static float s_gripOverride[2] = { -1.0f, -1.0f };   // [DEVBRIDGE] "dgrip"
+extern "C" void OLInteract_DevGripOverride(int h, float w) { if (h >= 0 && h < 2) s_gripOverride[h] = w; }
+extern "C" void OLInteract_HandGrip(float w[2]) {
+    if (s_gripOverride[0] >= 0.0f || s_gripOverride[1] >= 0.0f) {
+        w[0] = s_gripOverride[0] > 0.0f ? s_gripOverride[0] : 0.0f; w[1] = s_gripOverride[1] > 0.0f ? s_gripOverride[1] : 0.0f;
+        return;
+    }
+    const bool fresh = s_tickMs && GetTickCount64() - s_tickMs <= 1000;
+    w[0] = fresh ? s_gripW[0] * s_gripW[0] * (3.0f - 2.0f * s_gripW[0]) : 0.0f;
+    w[1] = fresh ? s_gripW[1] * s_gripW[1] * (3.0f - 2.0f * s_gripW[1]) : 0.0f;
+}
+// [HOLSTER] What ol_ue3 does with the game's handycam model this frame.
+extern "C" int OLInteract_CamVisual(OLCamVisual* v) {
+    if (!v) return 0;
+    memset(v, 0, sizeof(*v));
+    // a hitch (or a snapshot) of up to a second keeps it where it is; menus and cutscenes stop the tick
+    if (!HolsterOn() || !s_tickMs || GetTickCount64() - s_tickMs > 1000 || s_camUp < 0) return 0;
+    // During a reload (ours or the game's) or the game's lowering, the camcorder stays in Miles's
+    // animated hand - never the hip or the eye.
+    if (s_batReloading || GameReloading() || s_yWaitLower) {
+        v->mode = 1;
+        v->blend = 1.0f;
+        const V3 rel = Sub(s_holster, s_headT);
+        v->holsterRel[0] = rel.x; v->holsterRel[1] = rel.y; v->holsterRel[2] = rel.z;
+        v->torsoFwd[0] = s_torsoF.x; v->torsoFwd[1] = s_torsoF.z;
+        return 1;
+    }
+    // While the game is raising / lowering the camcorder with its own arm animation, show the model
+    // at the eye zone so Miles's animation is visible WITH the camera in it (not hidden, not stuck
+    // on the chest while the controller hand is hidden).
+    if (s_facePending || s_faceLowering) {
+        v->mode = 1;
+        v->blend = 1.0f;                              // fully at the eye zone
+        const V3 eyeRel = { 0.035f, -0.035f, -0.11f }; // same as CamRaise's eye zone
+        v->holsterRel[0] = eyeRel.x; v->holsterRel[1] = eyeRel.y; v->holsterRel[2] = eyeRel.z;
+        v->torsoFwd[0] = s_torsoF.x; v->torsoFwd[1] = s_torsoF.z;
+        ILog("[OLVR][FACECAM] camcorder shown at the eye during %s animation",
+             s_facePending ? "raise" : "lower");
+        return 1;
+    }
+    // Held by the hand but still where the face was (the grab, before it is carried away): same
+    // treatment as the pinned case - the model is hidden at the eye zone and the hand is hidden too
+    // (OLInteract_CamInHandAtFace), so only the camera screen shows.
+    if (s_hState == H_IN_HAND && s_camGrabbedAtFace) {
+        v->mode = 2;                              // model INVISIBLE at the eye
+        const V3 eyeRel = { 0.035f, -0.035f, -0.11f };
+        v->holsterRel[0] = eyeRel.x; v->holsterRel[1] = eyeRel.y; v->holsterRel[2] = eyeRel.z;
+        v->torsoFwd[0] = s_torsoF.x; v->torsoFwd[1] = s_torsoF.z;
+        return 1;
+    }
+    if (s_camUp == 1 && s_faceLock) {
+        // Pinned at the face: model stays HIDDEN at the eye zone. Grab zone moves to the face so
+        // the player can grab it physically exactly as from the hip.
+        v->mode = 2;                              // model INVISIBLE at the eye
+        const V3 eyeRel = { 0.035f, -0.035f, -0.11f }; // same as CamRaise's eye zone
+        v->holsterRel[0] = eyeRel.x; v->holsterRel[1] = eyeRel.y; v->holsterRel[2] = eyeRel.z;
+        v->torsoFwd[0] = s_torsoF.x; v->torsoFwd[1] = s_torsoF.z;
+        return 1;
+    }
+    // [FACECAM] At your eye the model is hidden and only the screen shows. While it is held in the hand
+    // the HAND goes with it (OLInteract_CamInHandAtFace), so raising it to look through never draws
+    // either inside your face. Off the eye it is drawn by the blend below - which is at 1 while it is
+    // held, so it sits in the hand, and 0 when it has been let go.
+    if (s_camUp == 1) { v->mode = 2; return 1; }   // at your eye: looking through it, model hidden
+    v->mode = 1;
+    const float b = s_camBlend;
+    v->blend = b * b * (3.0f - 2.0f * b);            // eased glide between chest and hand
+    const V3 rel = Sub(s_holster, s_headT);
+    v->holsterRel[0] = rel.x; v->holsterRel[1] = rel.y; v->holsterRel[2] = rel.z;
+    v->torsoFwd[0] = s_torsoF.x; v->torsoFwd[1] = s_torsoF.z;
+    return 1;
+}
+// [BATTERY]  Where the spare cell should be drawn this frame: hidden on the hip, in the
+// left hand, or fading back while the game's reload animation plays.
+extern "C" int OLInteract_BatteryVisual(OLBatteryVisual* v) {
+    if (!v) return 0;
+    memset(v, 0, sizeof(*v));
+    if (!HolsterOn() || !s_tickMs || GetTickCount64() - s_tickMs > 1000 || s_camUp < 0) return 0;
+    if (s_batState == BAT_NONE && !s_batReloading) return 0;
+    v->mode = 1;
+    v->blend = s_batBlend;
+    v->alpha = s_batAlpha;
+    const V3 rel = Sub(s_batHip, s_headT);
+    v->hipRel[0] = rel.x; v->hipRel[1] = rel.y; v->hipRel[2] = rel.z;
+    v->torsoFwd[0] = s_torsoF.x; v->torsoFwd[1] = s_torsoF.z;
+    return 1;
+}
+// [DOCUMENT]  Where the confidential document should be drawn this frame: hidden on the
+// left shoulder, in the left hand, or nothing at all (the same shape as the battery visual).
+extern "C" int OLInteract_DocumentVisual(OLDocumentVisual* v) {
+    if (!v) return 0;
+    memset(v, 0, sizeof(*v));
+    if (!HolsterOn() || !s_tickMs || GetTickCount64() - s_tickMs > 1000 || s_camUp < 0) return 0;
+    if (s_docState == DOC_NONE) return 0;
+    v->mode = 1;
+    v->blend = s_docBlend;
+    v->alpha = s_docAlpha;
+    const V3 rel = Sub(s_docShoulder, s_headT);
+    v->shoulderRel[0] = rel.x; v->shoulderRel[1] = rel.y; v->shoulderRel[2] = rel.z;
+    v->torsoFwd[0] = s_torsoF.x; v->torsoFwd[1] = s_torsoF.z;
+    return 1;
+}
+// [DOCUMENT] The document is held in the left hand.
+extern "C" int OLInteract_DocumentHeld() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    // [DOCUMENT] only once it is really in the hand: while it slides off the shoulder (blend 0..1) the
+    // wrist turn must not pop in, and a document resting on the shoulder must never roll the arm.
+    return (s_docState == DOC_HELD && s_docBlend > 0.9f) ? 1 : 0;
+}
+// [BATTERY] The game's reload animation is playing: do not solve the arms from the controllers.
+extern "C" int OLInteract_ReloadNative() {
+    if (!s_tickMs || GetTickCount64() - s_tickMs > 250) return 0;
+    return (s_batReloading || GameReloading()) ? 1 : 0;
+}
+// [BATTERY] While the mod's reload animation starts, hand the arms from the IK to the animation
+// gradually: 1 (full IK) at the start, 0 (full animation) after ~0.45 s. This keeps the hands from
+// snapping to the animation's start pose. The game's own reload (GameReloading, not ours) returns 0
+// straight away so it still takes the arms over at once.
+extern "C" float OLInteract_ReloadBlend() {
+    if (!s_batReloading || !s_batReloadAt) return 0.0f;
+    const float t = (float)(GetTickCount64() - s_batReloadAt) * 0.001f;
+    const float k = t / 0.45f;
+    return k >= 1.0f ? 0.0f : (1.0f - k);
+}
+
+

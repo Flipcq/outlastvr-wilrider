@@ -1,0 +1,709 @@
+# Outlast 1 VR native-source baseline
+
+This project extends an earlier GPL-3.0 Outlast VR source archive.
+
+## Source provenance
+
+- Original mod: the Outlast VR mod by **StrikeZoneVR** (StrikeZone Gaming TV), published as
+  `github.com/StrikeZoneVR-hub/OutlastVR` under GPL-3.0. The proxy, the stereo renderer and
+  the camcorder launcher are that project's work.
+- Original archive: `outlast-vr-mod-master.zip`
+- Original archive SHA-256: `076BEC496CE6CE255E9550C5284878FE0DE28B29D7C10AA970D62D16B666A4AE`
+- Imported: 2026-09-19
+- Upstream license: GPL-3.0
+- Upstream copyright and vendored dependency notices remain intact.
+
+This file is the **change log of the takeover**: one section per test build, in the order
+they shipped, each keeping the tester quote that drove it. For the measured performance
+work see [PERFORMANCE.md](PERFORMANCE.md); for the open items see [ROADMAP.md](ROADMAP.md).
+
+---
+
+## The takeover baseline (Test28 + Test16)
+
+The last confirmed working base this project was handed over with, kept for the record. It is the
+state the renderer and the arm solver were built on.
+
+This package is the last confirmed working base:
+
+- **Test28** renderer, OpenXR startup, stereo, menus, body anchoring, and controls.
+- **Test16** calibrated visible upper-body IK. Both arms follow Quest controller poses during ordinary gameplay.
+
+The separately supplied Test28 build and the currently installed working DLL share this SHA-256:
+
+`A329AEAD137F7830CBE2B090FD92D4CEEC84985ADE9B15FE8F05D1F0738EF607`
+
+- Building is covered in [BUILD.md](../BUILD.md); the output is `builds/d3d9.dll`.
+
+## Clean baseline changes
+
+- Preserved the upstream same-frame native stereo renderer and OpenXR camera hook.
+- Added a shared body-boundary clamp to the recentered OpenXR position before both the UE3 camera and compositor consume it.
+- Kept limited positional 6DoF for natural leaning and crouching.
+- Disabled experimental arm/skeleton driving.
+- Disabled experimental hand-directed camera takeover.
+- Enabled Touch-controller virtual-gamepad input.
+- Set the narrow-view cinema threshold to 45 degrees so startup/menu views use the comfortable screen while gameplay and wider scripted scenes stay native stereo VR.
+- Added a muted-blue branded cinema backplate. The
+  only visible credit text is `VR mod made by the Outlast VR authors`.
+
+The failed wrapper/hybrid experiments from Tests 10-13 are not part of this source tree or package.
+
+## Phase 2 (Test 35) changes
+
+- Headset-resolution rendering: `FViewport::UpdateViewportRHI` is hooked so the engine sizes its
+  windowed backbuffer at 2 x the runtime's recommended eye size (`[Render] HighResRender`).
+- The game's D3D9 runs on Windows' D3D9On12 layer (`[XR] D3D9On12`), and finished frames reach the
+  D3D11 bridge through a shared D3D12 texture plus shared fences (`[XR] ZeroCopy`). The old D3D9
+  readback, now asynchronous, remains as the fallback.
+- Scene-state reflection (pause, cinematic, scripted movement, the game's menu stack) puts every
+  menu on the cinema screen and hands scripted scenes back to the game's own arm animation.
+- Developer test bridge (`[Debug] DevBridge`, off by default) for scripted input and snapshots.
+- New found-footage launcher (`launcher/`), applying the same ini profile as `Outlast-VR.bat`.
+
+## Phase 2 (Test 36) changes
+
+Fixes for the Test 35 headset report ("jitters and stuttering", "after the car the arms don't move").
+
+- Arms (`[NAMESFIX]`): GNames is a TArray the engine reallocates when a level load adds names. Test 35
+  found it at the main menu and cached the data pointer; after the save loaded every name lookup read
+  the freed block, `Miles_beheaded` was never recognised and the IK never ran. Lookups now re-read the
+  in-exe `{Data, Num, Max}` slot. `[IKDIAG]` logs why no arm solve happened (every 5 s, capped).
+- Jitter (`[FRAMETAG]`): UE3 builds views on the game thread and presents on the render thread (logged
+  thread ids differ). Test 35 promoted/tagged the head pose at Present, so each image carried the NEXT
+  frame's pose (measured with a synthetic head turn: 236 of 236 frames wrong). The game thread now
+  latches the pose once per frame (`OLXR_FrameLatch`: player tick, IK, split start) and records it at
+  split end keyed by the left FSceneView's view+projection matrices; the render thread identifies the
+  frame in the `[PVS]` hook (InitViews passes its FViewInfo copy) and Present uses that exact record.
+  `[XR] FramePoseLatch=0` restores Test 35.
+- Lens-shaped eyes (`[LENSFIT]`): FSceneView's constructor (RVA 0x8BF640, arg 18 = projection,
+  16-byte aligned) gets each eye's own off-centre frustum during the split's eye passes; the bridge maps
+  each half 1:1 (`BlitFitToEyeTan`) and the UI mirror centres each eye's box on its straight-ahead.
+  Same pixel cost, no ~1.24x stretch. `[Render] LensFit=0` = old centred render.
+- Frame rate (`[D3D9EX]` + `[EXSHARE]`): measured at the asylum gate on the null headset with
+  publishing paused: native D3D9 78 fps, D3D9On12 46 (render thread bound by 9On12 translation).
+  The game now gets a D3D9Ex device; every MANAGED create is translated (textures -> DEFAULT+DYNAMIC,
+  buffers -> DEFAULT). Frames are StretchRect'ed into 6 shared render targets, published when their
+  D3D9 event query completes, and opened by the D3D11 bridge (legacy shared handle) - no CPU/GPU sync.
+  Result with frames delivered: 74-81 fps (was ~46). `[XR] D3D9Ex=0` falls back to D3D9On12+ZeroCopy.
+- `[CPUSPLIT]`, `[XRTIMING]` and `[FRAMETAG]` lines every 5 s; DevBridge commands `hands`, `headwave`,
+  `lensfit`, `latch`, `occl`; `[Debug] FakeEyeFov=1` gives a symmetric test headset Quest 3 frusta.
+
+## Phase 2 (Test 37) changes
+
+Test 36 report: "zoom in and out does nothing", "the right stick moves the view up and down like an
+Xbox controller"; request: motion controls for doors, camcorder and battery reload, with developer
+markers, feeling like a native VR game; the game's hints in Quest 3 words.
+
+- Zoom (`[VIEWFINDER]`): the game zooms by narrowing the camera FOV, which the per-eye VR FOV
+  override discarded. While `OLHero.CurrentCamcorderZoomFactor` (+0x31AC) > 0.03 (exit < 0.01) with
+  the camcorder up, `Hook_GetFovAngle` renders 2*atan((1-z)*tan30 + z*tan4), LensFit is skipped and the
+  frame carries flag bit1; the bridge shows head-locked 60-degree quads cropped to 4:3.
+- Stick pitch: `[Input] StickPitch` defaults to 0; `LevelPitch` nudges the right stick to level any
+  pitch the game keeps (deadzone 1.5 deg) in gameplay while the camcorder is down.
+- Interactions (`ol_interact.cpp`, `[INTERACT]`, ticked at split end on the game thread):
+  - Mapping: the camera hook records the head-centre world position and base yaw at eye phase 1;
+    world = head + fwd*(-dz*100) + right*(dx*100) + up*(dy*100) for recenter-frame metres.
+  - Doors: `OLObjectsOfClass("OLDoor")` every 2 s, doors within 4 m with DoorType (+0x308) 0. Knob =
+    native 0xCB24D0 `(door, float* out)`, hinge = door mesh (+0x258) LocalToWorld origin (+0xF0).
+    Grab on a grip edge within 26 uu; while held r = r0 + sign*Wrap180(a - a0)/MaxOpenAngle (+0x2BC),
+    sign = -1 (+1 if bReverseDirection), written to TargetOpenRatio (+0x190C) - the door's own tick
+    swings it. Locked = bLocked && !bFakeUnlocked (bitfield +0x2C4). Release on grip open or slip > 45 uu.
+  - Camcorder: eye zone = head + R(head)*(0.035, -0.035, -0.11); raise after 140 ms within
+    `[Motion] RaiseToEyeReachM` (0.14), lower beyond reach + 0.14 if raised by gesture; presses RB.
+    `OLInteract_RightArmNative` hands the right arm to the game's pose while raised at the eye.
+  - Battery: pouch = head + yaw-only (-0.20 right, -0.58 up, +0.04 back); grip edge in the pouch while
+    not moving takes one if `OLPlayerController.NumBatteries` (+0xAA0) > 0; release within 0.18 m of
+    the right hand presses Y; gestures pause 2.5 s for the reload, then re-arm once.
+  - Grips: a grip that started a grab/battery stays blocked until it opens (unblocking a closed grip
+    was a fresh RB press); a grip the game already had (sprint) stays the game's past knobs.
+  - Markers: OpenXR quad layers (6 colour ring textures) in LOCAL space, alpha-blended; haptics per hand.
+- Hints (`ol_prompts.cpp`, `[PROMPTS]`): UOLUtils' token resolver (RVA 0xD8BF90,
+  `FString* (FString* out, const FString* in)`, reads `in` only) turns `{OLA_x}` into `{X}` (pad icon)
+  or `(E)`. The hook passes a rewritten copy: whole INT hints replaced while their gesture is on, every
+  other token named as its Quest 3 control (the d3d9_proxy button map). `[Motion] QuestPrompts`.
+- DevBridge: `hand`, `grip`, `look`, `setf`, `tp`; DevGet prints struct values.
+
+## Phase 2 (Test 38) changes
+
+Request: a camcorder holster ("pick up smoothly and bring to face"), a reworked VR reload with
+indicators, then the launcher with more settings and a Quest 3 controller layout in words.
+Choices: right-chest holster, let go = back to the holster, eject then insert, teach-then-fade labels.
+
+- Holster (`[HOLSTER]`, ol_ue3 `CamPlace` + ol_interact `Holster`):
+  - OLHero.CameraMesh (+0x2CF0, SkeletalMesh `handycam`) hangs from Miles's body mesh at bone 52
+    `Hero-R-Hand_aux`; the game keeps it HiddenGame=1 in first person whether raised or not.
+    CameraMeshShadowProxy (+0x2CF8) hangs off the hidden ShadowProxy body the same way.
+  - Shown/hidden with `UPrimitiveComponent::SetHiddenGame` = vtable slot 0x4C0 (execSetHidden at
+    RVA 0x2516D0, prologue checked), game thread only.
+  - Placed every frame inside the arm-solve hook by rewriting its FAttachment (stride 0x34: comp,
+    FName, RelativeLocation, RelativeRotation, RelativeScale) in SkeletalMeshComponent.Attachments
+    (+0x3EC): Rel = BoneCS^-1 * Target, FQuat->FRotator as UE3's FMatrix::Rotator.
+  - Targets: in the hand = the right grip pose through the arm's own mapping (body basis *
+    PoseGripCanonical); on the chest = Miles's right collarbone root + (-17 up, 11 fwd, 10 right) uu.
+    Blend eased 0..1 (0.18 s out, 0.28 s back), hidden while CamcorderState == 1.
+  - The camera bone is ~30 cm ahead of Miles's torso, so the drawn chest model maps back ~18 cm
+    behind the real-chest reach point; ol_interact accepts a grab at either.
+  - Holster mode blocks the right grip from the game; raise = model at the eye zone (reach 0.14 m).
+- Reload (`[RELOAD]`): slot = right grip + R(0, 0.03, 0.07) m. Left grip at the slot + pull > 8 cm =
+  eject (visual only: the game battery keeps running), release = drop; pouch only gives a new one
+  with the slot empty; new battery within 7 cm of the slot = Y pulse (game reload). A NumBatteries
+  drop (Y fallback) re-loads the slot.
+- Body facing: a lazy torso yaw (head yaw with a +-35 deg dead zone) carries the holster and pouch.
+- How-to (`[HOWTO]`): one OpenXR quad atlas (rings, glows, 10 GDI-drawn labels; 18 separate
+  swapchains failed on SteamVR); labels counted per action in [Motion] Learned* (3 = learned).
+- Launcher: `Outlast1VR_Pages.cs` (partial Viewfinder): TAPE 02 VR SETTINGS (24 rows, ini via
+  Get/WritePrivateProfileString) and TAPE 03 QUEST 3 CONTROLS (procedural Touch Plus drawings from
+  Meta's product photos, animated callouts, gesture cards). Dev flags `--page`, `--page-sel`,
+  `--page-age`, `--settings-test DIR`.
+- DevBridge: `oget`, `raw`, `hide`, `camtune`.
+
+## (Test 39) changes
+
+Test 38 report: camcorder on the hip, reload = button, camcorder not in the native hand pose, doors
+should push Boneworks-style with a natural grip pose, notes close to gameplay on click, the body
+drifts so recentering is frequent. This build is the public release.
+
+- Holster on the right hip: visual from Miles's right thigh joint (bone 67) + (0 up, -1 fwd, 21 right)
+  uu, pitched 20 deg; reach point (0.20 right, -0.60 up, 0 fwd) m from the head (torso yaw).
+- `[NATIVEGRIP]`: while the camcorder is up at the eye (right arm native) the game's grip is captured
+  ~0.9 s in: finger locals (bones 37-51) and the hand aux bone 52 relative to the wrist 36 (bone 52 is a
+  child of 36). Baked default from this build's capture. Holding it lowered: wrist target =
+  controllerCam * gripAux^-1 (lens follows the controller), fingers + aux set to the captured locals,
+  attachment offset 0. The camcorder placement now runs after the helper rebase (Test 38 ran before).
+- `[DOORGRIP]`: the same finger locals plus extra bend about local -Z (thumb 0/18/22, fingers
+  38/48/32 deg) on a hand holding a knob; the left hand mirrors the right across the rig's one mirrored
+  local axis (axis 2, found from the reference pose's finger offsets: keep q.z, negate q.x/q.y, negate t.z).
+- `[DOORPUSH]`: the door panel = hinge -> knob; an open hand's signed distance from it picks a side once
+  clear of it (> 9 uu), then TargetOpenRatio keeps the panel 7 uu ahead of the hand on that side.
+- `[MENUPRESS]`: in the game's menus (OLUE3_InGameMenu: menu/paused/no hero) presses become 70 ms taps
+  and buttons held from a menu are silent after it until released. The note view closes the notebook
+  when the opening A is still down (raw pad: 300 ms closes, 80 ms does not). Pause = Menu RELEASE
+  without the left grip.
+- `[BODYFOLLOW]`: the position baseline is dragged with the head past the body bounds (x, z) and decays
+  toward the head (tau ~9 s) after 2.5 s still. `[Stage3] BodyFollow`.
+- Defaults: BatteryGesture=0 (Y reloads), DevMarkers=0. DevBridge: vrbtn, trig, bones, gripdump, dgrip,
+  curl, headoff. BUILD=OUTLAST1VR-1.0-20261014.
+
+## final (Test 40) changes
+
+ (Test 39) headset report: the camcorder looks wrong in the hand (the back of Miles's hand / his
+sleeve over it), climbing should use the hands (with a setting for the old way), jumping should keep the
+hands with the game's own hand animation, doors are janky and need physics. Release held for these.
+
+- `[FREEMOVE]`: OLPawn.LocomotionMode (+0x7BC, ELocomotionMode: 0 Walk 1 Fall 2 SpecialMove 3 Ladder
+  4 LedgeHang 5 LedgeWalk 6 Squeeze 7 Door 8 Locker 9 Cinematic ...) and OLPawn.SpecialMove (+0x7BD,
+  ESpecialMoveType, 101 moves) decide the arms: jumps, falls, landings, vaults, crouches keep the
+  player's arms (Test 39 handed every non-walk mode to the game); climbs / ledge hang / ladder: a
+  holding hand plays the game's arm, a free hand stays the player's; doors, lockers, beds, squeezes,
+  cutscenes stay native. The finger animation is the game's throughout (the IK moves whole subtrees).
+- `[CAMHOLD]` 3 (default): matched to the game's own camcorder raise animation (captured with
+  [Stage3] ArmDrive=0, CamcorderHolster=0, pad RB, HMD frames): forward = 75% Miles's facing (camera
+  bone forward) + 25% eye->hand, 35% of the eye->hand pitch, upright, then roll 12 deg about X and a
+  -60 deg turn about Z (g_camHold3, camtune 4) - from the eye the flip screen is face on with the left
+  side (dial, ports) and the fingers over the top, as in the game. The wrist follows (camcorder = wrist *
+  gripAux); the controller's rotation is ignored. Mode 2 (controller aim, upright) was the user's
+  "unnatural" build; Test 39 copied the controller's roll as well. Note: ArmDrive=0 also leaves the
+  reflection registry unresolved (fields MISSING) - test-only configuration.
+  Mode 1 (hand follows the controller, camcorder in its grip) put the lens sideways/backwards with the
+  arm calibration's wrist and is kept only as a dev switch (`camhold`).
+- `[DOORPHYS]`: doors a hand touches are simulated (angle, angular speed): push = one-sided contact with
+  a 1600 deg/s^2 limit (Miles's hand stops at the panel while the door catches up), side locked until the
+  hand leaves the panel; handle = spring (k 160, c 24); hinge friction viscous 3.2/s + 70 deg/s^2; soft
+  bounce at the open stop, latch at closed, stops against Miles (26 uu). Driven through 0xCC46A0
+  (OLDoor set ratio + target + navmesh obstacle, the game's own procedural-swing call). Doors the game is
+  using (DoorState 3/4, break state, DoorUser, bPlayingLocked/Blocked/AutoCloseAnim, bAITraversing) or
+  that the game moves itself are handed back at once.
+- `[CLIMB]` ([Motion] ClimbWithHands=1): edges = OLLedgeMarker -> Next (+0x24C) chains, flags at +0x260
+  (bCanClimbUp 0x8, bCanLedgeHang 0x4), OLGameplayMarker.bEnabled +0x240/0x1. A fresh squeeze with the
+  hand reaching onto an edge (22 uu across, -28..+16 uu height, reaching >= 15 uu toward it) holds it
+  (world anchor); both held (or left + camcorder in the right hand) and pulled 11 uu down/toward you ->
+  if the edge is > 40 uu away a 0.6 stick step toward it (<= 0.35 s, until 38 uu), then A standing still
+  (A while moving is the running jump: 2 m forward in testing); the game picks the move.
+  Ledge hang: both grips hold, a 12 cm pull -> A, both released 0.3 s after holding -> B. Ladder: a
+  squeeze holds the rung where the hand is; the left stick is driven by (rung z - hand z) / 12 uu until
+  the hand is back at the rung (tested: 35 cm pulls climb 33 cm, exit on top runs).
+- `[ANCHOR]`: OLInteract_HandAnchorWorld -> the arm solve blends the hand target to a world point through
+  Miles's component LocalToWorld (+0xC0). Checked: view centre == camera bone world (0.0 uu).
+- Labels: CLIMB, PULL YOURSELF UP; hints rewritten for climbing (G_CLIMB). Launcher: "Climb with your
+  hands" setting, CLIMB gesture card (replaces the button reload card). DevBridge: enum, cls lists
+  functions, hrot, camhold, ledges, doors, fakeledge.
+
+## Test 41 changes 
+
+User: "when I walk up to any climbing sections it auto goes into that climbing animation and feels weird
+with motion controls; the climbing should feel kind of like Boneworks". The log showed ladder auto-mounts
+(SMT 43/44) and auto exits (45/46).
+
+- `[CLIMBPACE]`: during the lifting climb moves (SMT 8, 9, 10, 14, 17, 19, 43, 46) with a hand holding on,
+  SkeletalMeshComponent.GlobalAnimRateScale (+0x2C4; Mesh +0x444 and ShadowProxy +0x2CE0) = holding hands'
+  downward speed / PaceNominal(sm) (43: 0.49 m/s, 46: 0.20, ledges 0.30 - one ~45 cm pull per move),
+  EMA 80 ms, 0..1.8; no hand holding -> 1; paused 5 s -> 1 for that move; restored to 1 outside climbs
+  and when the interaction tick stops. Measured: the ladder mount takes 0.92 s at 100%, 2.68 s at 25%
+  (root motion; a small part is time-based); the top exit 2.29 s.
+- `[LADDERGRAB]`: ladders = OLLadderMarker (+0x244 OtherMarker, Actor.Rotation +0x8C yaw: points to the
+  climbing side). Within 100 uu of a ladder foot (climbing side) or top (floor side), with no hand on it,
+  OLInteract_FilterMoveStick removes the stick component toward it (the game mounts from ~90 uu walking
+  in - a 90 uu block window never caught it). A fresh squeeze within 45 uu of its axis takes it: stick
+  toward it for 0.8 s -> the game's mount, paced. Dev: ladderblock.
+- Note: OLUE3_FindProp rejects a non-bool field when a mask pointer is passed - pass nullptr for floats.
+
+## Test 42 changes 
+
+User: "the body and arms don't do great following your movements - sometimes the arms deform from moving
+around a lot or crouching". `[ARMFIX]` (g_armFix mask, dev "armfix", default 15):
+- 8 steady twist helpers: the forearm / upper-arm twist chains (29/11, 31/10, 53/35, 55/34) were
+  PoseRebaseHelper'd from the LIVE native pose each frame; measured native helper->driver drift (ARMDIAG):
+  standing < 5 deg, walking / sprinting 12-19, crouching / crouch-walking up to 31 (left forearm). Now
+  placed by their relation in the reference pose (captured with PoseCaptureReference). Hand aux 28/52
+  drift was 0 and stays live (the camcorder grip uses 52).
+- 1 hinge elbows: the upper arm turns by IQFromFrames(upper dir, hinge axis) instead of the shortest arc,
+  hinge = cross(shoulder->wrist, elbow offset); the forearm then turns about the hinge only.
+- 2 the wrist roll's twist about the forearm axis goes 50% into the forearm subtree, the rest at the wrist.
+- 4 collarbone: turns toward last frame's target by 0.45 * (height above the shoulder / arm length) +
+  0.25 * (reach past 80% of arm length), at most 25 deg.
+
+## Test 43 changes 
+
+User (Test42 video/screenshot): camcorder "does not go in front of my face / not much free movement",
+"reverse engineer the climbing ... like a native VR game, keep the old option", "the first jumpscare at the
+door does not happen when I open it with motion controls", "a surprise motion feature", "the storm is way
+louder". Choices: free-hold camcorder with a live screen; cover your mouth.
+
+RE facts (OLGame.exe):
+- `AOLDoor::execTriggerEvent` 0xCA4980 -> vtable +0x750 = `AOLDoor::TriggerEvent(byte, Pawn)` (0xD66D90 in
+  this build, hooked from a door's vtable): walks GeneratedEvents for OLSeqEvent_Door and calls
+  CheckActivate with ActivateIndices = [type] (output link = type).
+- Door open 0xD4A770 (Instigator rdx): TriggerEvent(0) if DoorState==0, DoorState=1, TriggerEvent(1).
+  Close 0xD58AEB: TriggerEvent(2), DoorState=2. Locked try 0xCDE640: DoorState=4, TriggerEvent(3).
+  DoorState: 0 shut, 1 open, 2 closing, 3 player interacting, 4 animating. AI bashing fires 5 / 6.
+- ESpecialMoveType (103): 24/25 Enter/ExitSqueeze, 28 EnterDoorInteraction, 29 OpenDoorInstant,
+  30 OpenDoorPartial, 31 TryOpenLockedDoor, 32 RunThroughDoor, 33 CloseDoor, 38/39 Locker, 40/41 Bed,
+  49 PickupObject, 51-53 Struggle, 62-70 grabbed/thrown/killed/dying (full list in the Test43 log).
+- EPhysics: 0 None 1 Walking 2 Falling 4 Flying 9 Ladder. Actor.Physics +0xA8.
+- `AActor::Move(Delta)` 0x652FF0 (= GWorld 0x14200B5A8 ->MoveActor 0x509DF0, flags 0); setPhysics = vtable
+  +0x420 (NewPhysics, NewFloor, &NewFloorV).
+- Miles's Location is at his feet: eyes 163-169 uu over it; standing on the scaffold he is 2 uu under the
+  platform's edge marker. OLLedgeMarker sits on the lip; OLLadderMarker at the standing height (bottom
+  -191 / top 108.7 on the scaffold ladder). CylinderComponent: radius 30, half-height 82.5.
+- Wwise: OLGame.exe EXPORTS AK::SoundEngine (PostEvent id/name/wide, ExecuteActionOnEvent,
+  SetListenerPosition, SetObjectObstructionAndOcclusion, SetState, SetRTPCValue, ...). The game posts by
+  wide name. Miles's breath: VO_MILES_RUN_BREATH (+ VO_MILES_RUN_STOP 0.4 s later) after a sprint;
+  STRESS_BREATH / BRE_* / pain breaths from scripts. Chris Walker = "Soldier" (Play_SOL_*).
+
+New code: `[DOOREVENT]` (ol_ue3 hook + ol_interact open/close mirroring, 2 s hands-off after X),
+`[PHYSCLIMB]` (ol_interact; ClimbMode 2/1/0), `[CAMHOLD]` mode 4 + `[FLIPSCREEN]` (ol_ue3 publishes the
+screen pose, ol_xr draws a 384x288 night-vision crop quad; g_flipScr 1.5 -8.2 3.2 uu, 0.062 x 0.046 m),
+`[BREATH]` (ol_sound.cpp Wwise hooks + ol_interact gesture), `[AUDIODIAG]`. Dev: `climbmode`, `doorev`,
+`flipscr`, `phys`, `hmove`, `fakeledge [cm]`, `camtune 5`.
+
+Night vision (later Test43): `[HANDNV]` - right-stick click on the camcorder in hand switches the flip
+screen's night vision; synced once per raise with OLHero.CamcorderMode (+0x303D: 0 CCM_Default,
+1 CCM_PoweredNightVision, 2 CCM_NightVision) by an R3 pulse, then the game's mode is adopted
+(OLProxy_SetNvRequested). The hero's lamps: NVLightPowered +0x2D40, NVLightDefault +0x2D48, DarkLight
++0x2D50 (SpotLightComponents). `[NVEYES]` - the lamp's lighting is cut at each eye's outer side under
+[LENSFIT]'s off-centre frustums (ruled out: aim, shadows of the hands, scissor - FD3D9DynamicRHI::
+SetScissorRect 0xBF4C00 hook kept, off, dev "scissorfix"); while NV is up the eyes render symmetric.
+
+## Test 44 changes: walk around for real (roomscale)
+
+User: "when you move in real life in VR the body in game moves with you too" (they test it on the Quest).
+`[ROOMWALK]`: what `[BODYFOLLOW]` drags the position baseline by (past the body bounds / the 2.5 s settle)
+is handed to Miles instead of dropped. ol_xr: `g_rwCum` (XR thread) -> `g_rwPend` with the pending pose ->
+`g_rwLat` at PromotePendingPose; `OLXR_RoomWalkTake` (game thread) returns the latched total since the last
+take; `OLXR_RoomWalkAllow` (ol_interact, every tick, 200 ms lapse) gates the hand-off. ol_interact
+`OLInteract_RoomWalkStep` runs from Hook_NativePlayerMove right after OLXR_FrameLatch (and from the tick
+without the latch): recenter (x, z) m -> world uu by the body yaw (as TrackToWorld), `OLUE3_HeroMove`,
+step-up (30 uu) when held back over 40%. Gate `RoomWalkWhyNot`: setting, head position on, not
+SceneScripted, LocomotionMode 0, Physics 1, not climbing. `[Motion] RoomscaleWalk` (menu "Walk around for
+real", launcher MOVEMENT). Verified with headoff ramps on the null headset: 1 m -> 90 cm, wall blocks.
+
+## Test 45 changes: tester build
+
+- `[CAMADJUST]` free hold aims with the controller's AIM pose (the grip's forward runs up the handle: the lens
+  pointed up). Player placement: `OLInteract_Get/SetCamAdjust` -> `OLUE3_SetCamAdjust` (g_camHold4 = -roll,
+  -tilt, turn; g_camAdjOff added to the right hand's IK target while camHold > 0, in the view frame). Menu
+  sliders (CAMCORDER), [Motion] CamcorderTilt/Turn/Roll/ForwardCM/UpCM/RightCM.
+- `[OBJSCAN]` `OLUE3_ObjectsOfClass` serves a cache; `OLUE3_ObjScanStep` (interaction tick) walks 4000
+  objects a frame for every registered class; first lookup of a class = one full scan (logged with ms).
+- Ladders: `s_ladderBlockUU` 0 (no barrier); PhysClimb keeps Miles on a ladder with no hand (s_pcOnLadder)
+  unless at its foot or B.
+- Defaults: CamcorderLiveScreen 0 (experimental overlay), CoverMouth 0 (out of menus; OLSound_Install only
+  when 1 - ReadConfig reads it).
+
+## Test 46 changes: tester build 2
+
+- `[DIRECTTURN]` smooth/snap turn writes yaw straight into Actor.Rotation (+0x8C, by reflection) of BOTH the
+  PlayerController and the hero at the start of the player tick (`TurnApply`, before RoomWalk/LS_Tick). The
+  controller alone is overwritten: Outlast copies the pawn's yaw back each tick. Only while
+  `OLUE3_DirectTurnReady` (hero, move mode 0/1, no cinematic, look allowed, gameplay); otherwise the old
+  stick path. Rate = sign * t^1.5 * SmoothTurnDegPerSec ([Input], 30-360, default 150), snap = one
+  `OLUE3_TurnStep`. Null HMD: 1 s full stick = 148.7 deg; snap 90 = 16384 units in one frame.
+- `[LIVESCREEN]` + `[LENSCAM]` the flip screen shows the lens's own view:
+  - TextureRenderTarget2D.Create 352x264 (a size nothing else uses), SceneCapture2DActor spawned and moved
+    to the lens pose (CamPlace) every tick with Actor.SetLocation/SetRotation, 30 fps, post-process on,
+    MaxViewDistanceOverride 4000 uu. Enabled only while in hand with the screen facing the eye (600 ms).
+  - **UE3 ProcessEvent rejects functions with a native index**: UFunction.iNative (WORD +0xD4; FunctionFlags
+    +0xD0, FriendlyName +0xD8). SetLocation (267) / SetRotation (299) silently did nothing. `LS_Call`
+    zeroes iNative around the call (game thread) and restores it.
+  - d3d9 proxy `Hook_CreateTexture` (D3D9Ex only): after `OLProxy_LensExpect(w,h)` the next RENDERTARGET
+    texture of that size is the lens (AddRef'd, `OLProxy_LensTex`). `LensPublish` (Present, render thread)
+    StretchRects it into 3 shared D3D9Ex textures with event queries, at most every 30 ms; the bridge opens
+    the newest finished one (`LensSrv`) and `FlipScreenLayer` samples it whole (falls back to the eye crop).
+  - Cost on the null HMD: render thread ~3-5% while capturing. Dev: `lenssnap <name>`, `livescreen on|off`.
+  - The texture-swap approach (Screen_camera / camerahud D3D pointers) is dead: Screen_camera has no GPU
+    texture, CameraScreen_INST's graph is stripped. Its dev ops (ls*) remain for research.
+- Zoom (`MapPadButtons`): a mostly-vertical push (|y| > 0.45 and |y| > |x|) zooms; released below
+  0.25 or when x dominates. The first rule (|y| > 0.6 and > 2|x|) never fired on an ordinary push, so
+  the camcorder zoom looked dead and the W-T bar never moved. `[VIEWFINDER]` fills the view (quad sized
+  to the eye frustum x1.03) unless [Motion] ViewfinderFrame=1.
+- Vault fix: guided pacing (`paceable`) only for climbs the hands started (`s_climbByHands`); a sprint vault
+  with the left grip held (sprint) froze mid-move.
+- `[ASYNCLOG]` the log is buffered and written by a thread every 200 ms, lines prefixed with seconds since
+  start; `[HITCH]` lists frames over 40 ms in the PERF report.
+- Launcher: Turn speed, Camcorder display size (HudScalePct), Zoom with black bars; CamcorderLiveScreen
+  default 1. Outlast-VR.bat removed from the package (uninstall still removes an old copy).
+- `[MIRRORFPS]` the windowed Present of the 3456x1824 backbuffer (plus the one-eye blow-up) cost the render
+  thread ~1.6 ms a frame; during stereo play the monitor now gets [Render] DesktopMirrorFps (30, 0 = every
+  frame) presents a second - skipped Presents flush through an event query. Null HMD uncapped: door row
+  123 -> 152 fps, corridor 137 -> 180.
+- `[OCCLSKIP]` with OcclForce the occlusion query boxes are not drawn (draw hooks skip everything between an
+  occlusion query's Issue BEGIN/END) and GetData answers "visible" at once (no wait=TRUE stalls).
+  [Render] OcclusionSkip=1. +7-12% more (door row 163 -> 182, corridor 190 -> 203); picture identical.
+- Measured: post effects (DOF, SSAO, bloom, light shafts, lens flares, composite lights) change nothing -
+  the render thread (2 views of draw calls) is the limit; dynamic shadows off +6%; OcclForce off +2-12%.
+- Dev: `con <console command>` (PlayerController.ConsoleCommand, e.g. `scale set DynamicShadows False`;
+  `scale set ScreenPercentage` kills the game), `mirrorfps N`, `occlskip 0|1`. Null-HMD perf runs: test ini
+  PaceToHeadset=0 + OLEngine MaxSmoothedFrameRate=300; scratchpad measure.ps1 `Measure-OL`.
+
+## changes: camcorder HUD at reference scale
+
+- `[CAMHUD]` is the game's own fullscreen display, not a panel in front of your face. The quad used to be
+  0.60 m wide at 0.45 m (the middle ~67 deg), which made every readout look huge, close and bunched up in
+  the centre. It is now sized from the headset's horizontal FOV (`OLCamHud::PanelWidth`, clamped to 60-68
+  deg) and parked 2.00 m out, so the reference artwork spreads to the corners: REC and the clock top-left,
+  the W-T lever centred, the battery gauge top-right, the HD/AUTO/F2.4 lens markings bottom-left. The clamp
+  keeps the corner readouts clear of the lens edge, where they smear.
+- The artwork is back on the reference screenshot's own 1920x1080 coordinates (`DynamicTop = 0`, the
+  readout band is the top 160 rows again); the enlarged/inward layout of the previous test build is gone.
+- `PanelDistance` is the display's **stereo depth**, not just its size. A quad layer submitted in the
+  VIEW space is composited into each eye from that eye's own head-relative pose, so a plane d metres
+  ahead asks the eyes to converge on d - a single texture, but two different projections (OpenXR calls
+  a quad layer "a posable planar rectangle in the virtual world"; VIEW is the centroid of the two eye
+  origins in stereo, and the spec warns that head-locked content "may be uncomfortable to view if too
+  large"). The earlier
+  note here ("head-locked and mono, so it has no stereo disparity ... moving the quad on its own changes
+  nothing on screen") was wrong, and it is what "the focusing brackets sometimes look doubled" was: the
+  brackets are the one thin, bright, dead-centre shape, and the middle of a near plane is where its
+  disparity is largest (~3.4 deg at 1.05 m). With the eyes converged on the room behind the display, the
+  two copies do not fuse and read as two squares. At 2.00 m the display asks for ~1.8 deg - about what a
+  corridor or an ordinary room asks for anyway - so the box fuses with the scene (3.4 deg at 1.05 m, 2.4
+  at 1.5, 1.8 at 2.0, 1.4 at 2.5). `PanelWidth` scales with `PanelDistance`, so the fill is unchanged:
+  the same ~2.6 m plane covers the same part of the view, and only the depth the eyes are asked for
+  moves - which no monitor can show. The start-up log now prints it: `[CAMHUD] display W x H m, parked
+  D m out: N deg of convergence`. The REC light and battery gauge land at ~32 deg, with clear space
+  around the readouts; the 46 px REC caption is 1.7 deg tall. `tests/camcorder_hud_test.py` asserts the
+  panel's half-angle and that the convergence demand stays in the 1.5-2.2 deg band.
+- The focusing brackets in the middle of the display are 167x139 (was 212x178, and 354x298 in the
+  reference) on the same centre (960.5, 550.5), with 44 px arms and one-pixel strokes - the one shape in the
+  middle of the view with nothing behind it, so anything bigger read as an empty square hanging in front
+  of the face. They subtend ~6.5 x 5.4 deg. They are drawn in the HUD grey (#808079) instead of the
+  artwork's 190 or the 175 they had, which read as pure white against the dark scenes and pulled the eye
+  away from the picture.
+- The readouts sit one step further out and higher than the reference's own coordinates - REC/clock 80 px
+  left and 20 px up, the spare count and gauge 80 px right and 20 px up - because the shrinking quad put
+  the display's corners nearer the middle of the view. The gauge is pulled ~40 px left of where it was
+  (body right edge at x=1848, 72 px off the display's edge, ~31 deg out against the panel's ~33 deg edge):
+  the minimum that stops you having to stretch your eyes sideways to read the charge.
+- The focusing brackets are opaque, one pixel thin, in #808079 - a faint grey box rather than a bright
+  one. Translucency is not available on this path: the compositor multiplies the layer's colour by its
+  own alpha despite `XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT`, and a grey box meant to be soft
+  came out black at 200/255 and still dark at 235/255. The test asserts alpha 255, one-pixel strokes and
+  the exact grey, so the box can neither go dark nor thicken again by accident.
+- Palette: two inks, from the reference artwork. `#A71000` is the recording red - the REC lamp, its
+  caption and the timecode - and `#808079` is every other mark that is drawn (brackets, W/T, the lever,
+  the spare count, the gauge, the HD/AUTO badges, F2.4). There are no dark rims around the count or the
+  gauge any more: on a transparent layer a black outline is a black line drawn on the picture, not a
+  shadow. The HD badge's perforations are real holes (alpha 0), not black squares.
+- The charge gauge is the reference's long, thin cell: 212x48 (it was 64 tall), a rounded frame with a
+  transparent window, the contact on the LEFT as a bracket that opens into the body, and the charge
+  draining left to right - the bar empties at the contact end, so what is left of it sits against the far
+  (right) end. Continuous, no four-bar quantization; the low-charge warning (a quarter or less) is in the
+  recording red, and the spare count beside it stays in the HUD grey.
+- Two night-vision tell-tales sit under the gauge's right end - the eye and the speaker from the
+  reference - and are drawn only while night vision is running. They live inside the dynamic band, which
+  is cleared every frame, so switching night vision off takes them away again. The state comes from
+  `OLProxy_NightVisionActive()` (camcorder raised + night vision requested), which `[HANDNV]` keeps in
+  step with the game's own `CamcorderMode`, and it is published inside the same `[CAMHUD]` snapshot as the
+  clock and the charge.
+- `OLCamHud::ZoomUnit` normalises the zoom factor (0..1, and a 0..100 percentage build) so the W-T thumb
+  can never be pinned at one end, and the thumb is drawn as a grey body in a dark outline on a dark track,
+  so movement is visible against the lever's grey frame.
+
+## changes: stick dead zone, typed eye resolution
+
+- **"Miles runs but veers left, even with W on the keyboard."** Three separate ways the mod handed Outlast a
+  sideways push nobody asked for, and all three are fixed in `src/ol_xr.cpp`:
+  1. `[Input] StickDeadzone` defaulted to **0.00** in code, so any install whose ini predates the key (or one
+     an older build regenerated) had no filter at all: a stick resting at 0.15 walked him sideways, and the
+     `[XRINPUT]` stick gate is 0.12.
+  2. The filter was **radial only**. A radial dead zone cannot remove a small sideways value from a stick that
+     is pushed mostly forward - `(0.05, 0.95)` is 0.95 long, past any dead zone - and UE3 adds the pad's axis
+     to the keyboard's own W, so "forward" came out as a diagonal to the left. `ApplyDeadZone` now drops a
+     component under the dead zone **on its own axis** first and then applies the radial curve, clamped to
+     unit length (a diagonal can sit past 1 after the axial cut). Full stick is still full stick.
+  3. The analog **triggers had no dead zone at all**, and Outlast's triggers are `AnalogLeanLeft` /
+     `AnalogLeanRight`: a trigger resting a few counts above zero leans the player left for the whole session,
+     whatever the keyboard or the stick is doing - which is exactly the "even with W" part of the report.
+     `TriggerUnit` ignores anything under 0.12 and rescales what is past it, so a full pull is still a full lean.
+- The default is now **0.30** (ini and code), the file/text limit stays **0.60**, and the log line
+  `[STICKCENTER] ... dead zone N, triggers X Y` prints what was applied so a report can be read.
+- The launcher has the row: **MOVEMENT > Stick dead zone** (0-60% in 5% steps, `GAME'S` = 0). The launcher owns
+  the range: a value loaded outside a row's own bounds (a hand-edited ini) is clamped **and written back**, so
+  the ceiling cannot be exceeded from the launcher either. `tests/xr_deadzone_test.py` runs the real
+  `ApplyDeadZone` / `TriggerUnit` against synthetic values (the straight-line walk, the diagonal clamp, 0.00 =
+  passthrough, the trigger threshold) and checks the shipped default and the launcher's ceiling.
+- **Typed eye resolution.** In VR SETTINGS > PICTURE, the `width x height` numbers beside the manual
+  resolution slider are **two separate fields**: clicking one opens just that number (a boxed edit with a
+  caret), digits build it, Enter applies and saves that one dimension through the same
+  `SaveManualResolution` the slider uses, Esc cancels and Backspace edits. Clicking the other field while
+  one is open commits what was typed first, so "click the width, change it, click the height, change it"
+  needs no Enter in between; Tab does the same from the keyboard, and re-clicking the open field keeps the
+  draft. Each value goes through `EyeResolutionRange.Normalize`, so the slider's own bounds hold - 480-4096
+  per axis, 8-pixel steps - and an empty field is refused with a note in the tape log rather than applied.
+  While a field is open the keyboard belongs to it, so W/A/S/D cannot move the list; clicking anywhere
+  else (the slider, another row, BACK) saves what was typed, and Esc cancels it.
+
+## changes: the reference battery, and a deeper focus box
+
+- **The charge gauge is now the reference cell, drawn to its own proportions.** The cell keeps the
+  212x48 footprint and the top-right corner it had (nothing else on the display moves), but the artwork
+  inside it follows the reference: a rounded outline one uniform stroke thick (4 px, ~1/13 of the
+  height) around a hollow window, corners a hair over one stroke (radius 5, was 7), a compact terminal
+  tab on the LEFT - 13x22, centred on the cell, with an 8x14 slot cut out of its middle that dead-ends
+  at the outline instead of opening into the window - and the charge as one solid, square-cornered block
+  inset 8 px from the outline on every side (196x32, was 192x28 at 10 px) with the reference's soft
+  vertical fall (grey +14 at the top to -8 at the bottom, was +12 to -14). It still drains left to right,
+  and a quarter or less is still drawn in the recording red. `tests/camcorder_hud_test.py` asserts the
+  outline, the window, the tab (cap solid, slot clear, nothing above it), the block's gradient value and
+  both ends of the drain.
+- **`[CAMFOCUS]` the focusing brackets moved to a quad of their own, twice as far out.** The box is the
+  one thin shape in the middle of the view, and the middle of a plane is where stereo disparity is
+  largest - the old "the brackets look doubled" report. It used to ride the display's texture at
+  `PanelDistance` (2.00 m, ~1.8 deg of convergence). It now has its own 169x141 px swapchain (the
+  167x139 box plus a transparent pixel) and its own quad at `OLCamHud::FocusDistance = 8.00 m`, ~0.45 deg.
+  The quad is scaled AND offset by `FocusDistance/PanelDistance` (`OLCamHud::FocusQuadFor`), so it covers
+  exactly the pixels the display used to: same place, same apparent size on screen, deeper. The display
+  no longer draws the box at all, and every other readout - REC, clock, W-T lever, spare count, gauge,
+  HD/AUTO/F2.4, the night-vision tell-tales - stays at `PanelDistance` in its own position, untouched.
+  `CamcorderFocusLayer` logs `[CAMFOCUS] brackets WxH px on their own plane, parked D m out: N deg`, falls
+  back to "no box this frame" if the extra swapchain cannot be created, and is submitted only while the
+  camcorder HUD itself is. The test checks the scale/offset against the display's own angles, the
+  unchanged subtended angle, the ~0.9 deg convergence and that the display's texture carries no box.
+
+## changes: the battery reload with your hands
+
+- **The spare cell is physical and lives on Miles's left hip.** `[BATTERY]` spawns a collisionless
+  `StaticMeshActor` (`DynamicSMActor` fallback) with `CamCorderBattery-01` (resolved from the object
+  table, then the batteries pickup factory, then any `CamCorderBattery*` StaticMesh) and hangs it from
+  his left thigh bone through `USkeletalMeshComponent.AttachComponent`, the same mechanism the game's
+  handycam uses. Its `FAttachment` loc/rot is rewritten every frame from `BatteryPlace` in
+  `ol_ue3.cpp`: hidden at the left hip, blended to the left hand's auxiliary bone while held. The mesh
+  is written straight onto the `StaticMesh` property (the ProcessEvent path for `SetStaticMesh` does
+  not apply it) and a `HiddenGame` toggle rebuilds the scene proxy; visibility is `HiddenGame` (this
+  engine ignores the attachment scale). Miles's `LightEnvironment` is copied so the cell is lit. The
+  left hip uses the camcorder's waist-zone box mirrored to `-0.20 right, -0.60 up` (torso frame), so a
+  hand coming down, across, or resting in the lap when seated still reaches it.  the box is
+  tighter horizontally - 22 cm forward/side instead of 34/26 - so a hand held out in front at waist
+  height no longer takes the cell or the camcorder; the document's shoulder grab went from a 24 cm to a
+  15 cm sphere for the same reason.
+- **Squeeze the left grip at the left hip** to take it. Let go and it is hidden again and back on the
+  hip. The left grip is blocked from the game while it owns the battery. Its in-hand placement is tuned
+  live in the mod menu's **BATTERY RELOAD** section (forward/right/up and roll/pitch/yaw sliders), saved
+  to `[Motion] BatteryForward/Right/Up/Roll/Pitch/Yaw`; the DevBridge `battune` command drives the same
+  values.
+- **The reload is the game's animation, not the reload command.** With the camcorder held in the right
+  hand (`CamcorderHolster` on, model fully in hand, lowered so the animation is visible), bringing the
+  left hand within ~22 cm of the drawn camcorder starts `OLHero.AnimNameReloadBatteries` (the
+  `...Inactive` variant while the camcorder is lowered) through
+  `AnimNodeSlot.PlayCustomAnim` on `OLHero.FullBodyAnimSlot` - the slot the game's own full-body
+  animations go through - and the returned length times the swap. The animation plays from its
+  beginning, so the whole "grab a new cell from the hip" intro is kept; the old
+  `[Motion] ReloadAnimStart` skip (and its getter/setter) was removed.
+  `[BATTERY]` blocks both arms and both grips while it
+  plays, so the IK does not override Miles: no `Y`, no `OLA_Reload` pulse, and the camera need not be
+  at the face. When the animation ends the mod uses one `OLPlayerController.NumBatteries` spare and sets
+  `OLHero.CurrentBatterySetEnergy = 1.0` in code; `Y` remains the fallback reload.
+- The spawn/attach path logs `[BATTERY] spare cell spawned, collisionless, and hung from Miles's left
+  thigh`, and the animation start logs its name and length, so a report can tell a missing mesh from a
+  missing animation.
+
+## changes: climbing has three modes
+
+User: "restaurar codigo antigo de Climb PHYSICAL, deixar A button como padrao (launcher) ... physical climb so
+para plataformas mais altas que o Miles ... ao pular, o Miles agarra a mao esquerda automaticamente e a
+direita fica livre; ao segurar o grip esquerdo a mao passa a ser do jogador, soltar = cair ... 3 opcoes no
+launcher: A Button, Hybrid, Physical ... no physical o analogico esquerdo nao funciona ... o botao de pular
+so serve para se agarrar a uma plataforma mais alta ... subir ate uma certa altura e o jogo termina a
+animacao da escalada".
+
+- `[Motion] ClimbMode` is the switch: **0 = A BUTTON (the new default)**, 1 = HYBRID, 2 = PHYSICAL. A saved
+  `1` from the old builds (the Test41 guided climb, removed) reads as HYBRID, `>= 2` as PHYSICAL, anything
+  else as the A button (`ClimbModeFromSaved`). `ON_CLIMB` (`ClimbWithHands`) is derived from it, so the A
+  button mode leaves `[CLIMB]`/`[PHYSCLIMB]` completely idle - the game's own climb, untouched. Launcher,
+  mod menu and the shipped ini all default to 0; the in-game menu combo has the three names.
+- The decisions are pure functions next to the setting (`ClimbModeFromSaved`, `ClimbHandsOn`, `ClimbEatsJump`,
+  `ClimbStickRule`, `EdgeNeedsClimb`, `ClimbHandsOff`, `ClimbHoldPlaysGameArm`) so
+  `tests/climb_modes_test.py` can compile and
+  check them with g++: it also asserts the launcher row (`A BUTTON`/`HYBRID`/`PHYSICAL` -> 0/1/2, default 0),
+  the ini defaults, and that every call site is still wired (pad, stick, menu, hints, arms).
+- **PHYSICAL drives the game's own climb** : it no longer carries Miles with a physics-off carry.
+  `Climb`'s routing hands the physical carry (`PhysClimb`) to HYBRID only; PHYSICAL falls through to the guided
+  state machine and lets the game's own jump / hang / climb / ladder animations play, while the hands drive
+  them the way the button and the stick would: a pull sends A (`s_aFrom/s_aUntil`) for an edge, or the
+  synthesized stick (`s_ladderStick`) for a ladder. The holding hand stays in the game's pose
+  (`OLInteract_ClimbHold`), the free hand is the player's (relaxed open), and A is only a jump (it never
+  finishes a climb) while the walk stick only backs down (`ClimbStickRule`). This replaces the earlier
+  "hands carry Miles 1:1" model, which pushed the body without moving the hands and never matched the game's
+  grab pose.
+- **Only a platform he must climb**: a physical grip on an edge takes it only when the lip is over his eyes
+  (`[Motion] PhysClimbEdgeAboveEyes`, default 10 uu). A lower one (waist/chest height) stays the game's jump
+  or vault - the module logs the height it refused. Ladder rungs are unaffected (a ladder is a climb).
+- **PHYSICAL takes A out of climbing**: `OLInteractPad.removeButtons` (new field) carries `0x1000` and
+  `d3d9_proxy` clears it after `MapPadButtons` (the mod's own presses are added after that, so the climb-up /
+  drop pulses are never eaten), so A cannot finish a climb while he hangs or is carried (a jump off a ladder
+  still works; crouch still drops him).
+- **The walk stick where he is** (`ClimbStickRule`, pure): it never climbs a ladder for him, but it is not
+  simply off either - tester feedback: "o analógico precisa funcionar até o início da escalada ... se não eu
+  só fico escalando a escada de longe ... para voltar (descer a escada) ... e no final para terminar de
+  subir". So: free while walking, free with a hand on a rung and his feet still on the floor (the game mounts
+  it, no climbing from far away), on a ladder (3) back only (`CLIMB_STICK_DOWN_ONLY` - forward is the rungs')
+  until his feet are within `kPhysLadderTopFreeUU` (40) of that ladder's top, where it is free again and
+  finishes the step off; locked while the hands carry him off a ladder (edge carry, jump catch) and while he
+  hangs or shimmies on a ledge (4/5). `s_climbTopUnder` (his feet under the top of the ladder he is on,
+  `LadderNearHero`) feeds it, and only the forward component is zeroed in the `DOWN_ONLY` case. HYBRID and
+  A BUTTON keep the
+  game's own stick. `LadderWalkBlock()` has no barrier in this mode (`kPhysLadderBlockUU=0`): walking up to
+  the ladder works and the game mounts it by itself.
+- **`[LADDERMOUNT]` a floor rung steps him on**: in PHYSICAL, a hand that squeezes a rung while his feet are
+  still on the floor stays a rung hold (`s_holdLadder`) and the guided `[LADDERGRAB]` path pushes the walk stick
+  toward the ladder so the game mounts it. On the ladder (`lm` 3) the rung survives the mount: it is seeded into
+  `s_hold` and its stroke is re-anchored to where the hand is now, so the mount's body lift is not read as a
+  first pull. From there `PhysLadder` drives it: each stroke of a holding hand (its height against the head,
+  measured in the recenter frame) is one rung - the game lifting Miles moves his hand and head together, so it
+  is never a step, and a held hand never runs off to the next rung by itself. HYBRID keeps the physics-off
+  carry for ladders (its A button still climbs, so the native exit is not required).
+- **The carry is anchored at the controller, not the ledge point** (HYBRID): `s_pcT0[h]` (the reference for
+  the hand's pull) holds the recenter-frame controller pose `P3(fh.hand[h])`, never the world ledge point
+  `s_holdW[h]` - subtracting a world uu point from a recenter metre pose threw Miles sideways (hundreds of
+  metres) the moment a grip was taken. The hold's world point (`s_holdW`) is only what his body is moved toward,
+  in the same frame as the tracked hand.
+- **`[CLIMBGRAB]` the automatic left hand**: PHYSICAL does not carry Miles at all - it asks the game to climb.
+  `PhysAutoCatch` holds the left hand on the ledge by itself while he jumps at one (the climb special move) and
+  in the fall, so it is already playing the game's grab pose when the game hangs him (`lm` 4) - no delay, and
+  nothing is frozen (his physics stays the game's). The edge rule uses the eye height he took off from, so the
+  jump cannot lift his eyes past the lip before the hand catches it; a chest-high edge is still a jump/vault.
+  The hand lets go when he is back on his feet, and the crouch (drop) has a 1.2 s re-grab block.
+- **Either hand climbs; the left can be taken over**: in a PHYSICAL hang (`CL_HANG`) the left hand is held by
+  the auto-catch until the player squeezes its grip (`s_lOwned`): then it is the player's hand, like the right
+  one. A pull down on either hand (12 cm, one stroke, re-armed within 4 cm of where it took the grip) sends A
+  plus the walk stick forward - A on its own hopped him in place and slid him off, so the stick goes with it to
+  carry him onto the platform; a push up sends B plus the stick back (let go / go back). Letting the owned left
+  hand go while the right is not holding drops him (B after 180 ms); while the right hand holds he stays on. The
+  auto-catch never takes an owned hand back, and a new hang starts with the auto-grab again.
+  While the game climbs (`CL_CLIMBING`) either pull asks it to keep climbing and either push reverses it (B +
+  stick back), and the forward stick is kept alive only while the game's climb runs and an owned hand still
+  holds. Strokes are measured against the head, so the game moving Miles never fires one.
+- **Going down a ladder is the game's own descent**: the walk stick back (or a hand's push up) sets
+  `s_ladderDownUntil`; `OLInteract_ClimbHold(h)` then answers true for both hands, so `ol_ue3` leaves both arms
+  to the game's descent animation instead of relaxing the free hand open over it.
+- **Haptics on the physical climb**: the left grip buzzes once when it takes the auto-grabbed hand over; a pull
+  down buzzes the pulling hand, or both controllers when both hands are on the ledge and squeezing; letting go
+  with nothing else holding drops him after 150 ms with two buzzes in a row (the second 130 ms later, as he
+  falls).
+- **A holding hand stays in the game's pose**: `OLInteract_ClimbHold(h)` answers true for the guided climb
+  states (hang, climb, ladder) and for the PHYSICAL auto-catch (`s_pcAuto[h]`), so Miles's hand stays in the
+  game's grab position instead of jumping to the controller. `ArmMoveClass` maps those states to the
+  native-arms class; a released hand goes back to the tracked, open hand.
+- `HandOnEdge` kind 2 ("reaching up at an edge above its reach") never took an edge hold in the old code -
+  it needed a ladder rung under the hand -
+  which is exactly what a platform taller than Miles looks like from below: it now takes the edge when the
+  lip is over his eyes, holding where the hand is (`[PHYSCLIMB]` only; the guided path is untouched).
+- **`[CLIMBFINISH]` the game ends the climb**: once his hands have carried him up (`B.z` 15 uu over where the
+  hold was taken) and his eyes reach the lip (`[Motion] PhysClimbHandOffUU`, default 20 uu under it; 0 = off),
+  `PcHandOff` lets go, holds him still, and presses A for the game's own climb (at its own speed -
+  `s_climbByHands` off). If the game picks it up (`lm` 2/4) it plays its climb animation and `s_pcFinish` 2
+  restores his physics when it ends; if nothing comes back within 700 ms the existing `PcMantle` sweeps him
+  over the top instead.
+- `OLInteract_ClimbFinishing()` lets `ol_ue3`'s `ArmMoveClass` answer 2 while that happens, so both arms are
+  the game's animation rather than the tracked hands. `ArmMoveClass`'s climb-arms branch now reads
+  `OLInteract_Get(7)` (ClimbWithHands) - it was reading index 8 (the camcorder live screen), so climb arms
+  were never handed to the holds.
+- **`[CLIMBOPEN]` a free hand rests open**: during a climb (`ArmMoveClass == 1`: hang, ladder, a climb special
+  move) a hand that is not holding on would otherwise carry the game's own gripping finger curl (the hang /
+  ladder animations close both hands). `ol_ue3` now relaxes any free hand's fingers to the reference (open)
+  pose (`RelaxFingers`, blending the finger bones toward `g_poseRefLocal`), so the right hand looks open and
+  free while Miles's left hand does the grabbing.
+- Hints: `G_CLIMB_PHY` (PHYSICAL only) replaces the "or press A" wordings by hand-only ones; the hybrid ones
+  stay as they were. Menu/README/ini text rewritten for the three modes.
+- Found while editing the menu: every `OLInteract_Set()` in `ol_menu.cpp` was one index past its `Get` (the
+  "Walk around for real" row read and wrote the framed viewfinder, "Catch ledges automatically" wrote index
+  13, out of range, and did nothing). All of them now set the option they show.
+
+## changes: the jump / use press, and the Valve Index
+
+User: "Parece que o botao de pular e abrir porta nao esta sendo computado corretamente em 100% das vezes ...
+os controles da Valve nao funcionam corretamente no Mod, pesquise na internet e veja como implementar o
+funcionamento correto dos controles da Valve sem quebrar nem substituir o funcionamento dos controles atuais
+baseados no meta quest".
+
+Two separate leaks were making A (jump / vault) and B (use / open) miss, plus the two Valve Index bugs that
+were already on the roadmap. Nothing in the Quest path was moved; the only Quest-visible change is that a
+press can no longer be lost.
+
+- **`[PADLATCH]`** (`src/ol_xr.cpp`, `LatchPresses` / `LatchForget`). The pad the game polls is published by
+  the submit worker at display rate and read by UE3 on its own tick. `ReliablePadButtons` extends a press it
+  has *seen* by 100 ms, so a press that started and ended inside one slow game frame was invisible for good -
+  and the frames where that happens are the doorways, ledges and texture uploads the log already records
+  (>40 ms). Every discrete `OLXR_BTN_*` bit now stays down in the published snapshot for 150 ms
+  (`kPadPressHoldMs`), which is longer than any frame a player can still act in, so at least one poll sees it.
+  Level-triggered inputs (sticks, grips, triggers) are untouched; the mouse path keeps the raw edges (a tap
+  between two XR samples is still a down and an up in Windows' queue) and the both-stick recenter chord calls
+  `LatchForget` so a swallowed press cannot come back 150 ms later as a sprint.
+- **Use under sprint** (`src/d3d9_proxy.cpp`, `OLProxy_MouseUseSample`). The "no Use while the left grip is
+  held" rule was written for the  chords (left grip + B / + X opened the notebook); those chords are
+  gone, and all the rule still did was swallow B of every player holding the left grip - which is sprint. So
+  nobody could open a door while running at it. The grip that silences Use now is the one the mod itself is
+  using that frame: `OLProxy_SetLeftGripOwned(ip.blockGripL)` from the interact tick (a handle, a ledge, a
+  battery, a document), fresh for 400 ms, because a hands-on door already told the game to open and a Use on
+  top of it would close it again. With no tick talking (the hands-on layer off) the old grip rule stays.
+  `MapPadButtons` was not touched: left grip + X still does not crouch, and the Y / notes chord is unchanged.
+- **`[STICKCENTER]` a pushed stick is never nothing** (`src/ol_xr.cpp`, `StickCenter`, `kStickPushed = 0.45`).
+  This is the Valve Index / Pimax "cannot walk, but the grip still works" report. An active interaction
+  profile delivers all of its bound paths, so the stick was read and then thrown away here: a runtime that
+  reports no thumb on the stick *while the stick is held down* taught the drift fix that the pushed position
+  was the rest point (`s_stickRest`), and `if (touch == 0) ox = oy = 0` then read the stick as nothing for the
+  rest of the session. Two rules now hold: a rest point is only learned from a stick that is (nearly) centred,
+  and a stick past `kStickPushed` passes through untouched even while the drift fix is armed. The genuine
+  drift fix is unchanged for a stick that really rests off centre.
+- **`[INDEXMENU]` a menu the Index can actually reach** (`src/ol_xr.cpp`). `/input/system/click` is in the
+  Index profile but "may be unavailable for application use" (OpenXR interaction profiles) and SteamVR keeps
+  it for the dashboard - Valve's own tracker says a click there never reaches an app - so on an Index there
+  was no pause menu and no way into this mod's settings. The trackpads were unused; a firm press on the LEFT
+  one (`/input/trackpad/force`, a new optional FLOAT action `menupress`, 0.40 press / 0.20 release for
+  hysteresis) now sets `OLXR_BTN_MENU`, so the release-to-Start and left-grip-chord logic that already exists
+  works unchanged. `system/click` stays bound for the runtimes that do deliver it.
+- **`[PROFILE]` one refused path cannot drop a profile** (`src/ol_xr.cpp`, `suggest`). Per the OpenXR input
+  chapter, a suggested binding outside a profile's allowlist makes `xrSuggestInteractionProfileBindings`
+  return `XR_ERROR_PATH_UNSUPPORTED` for the *whole* call, which leaves that profile with no sticks and no
+  buttons while poses may already have come from elsewhere. Every profile is now suggested twice: the full
+  set, then the same set without the paths a runtime may refuse or never deliver (haptics, stick touch,
+  `system/click`, trackpad force). A second successful call for a profile replaces the first, so the retry is
+  well defined, and both results are logged with the path count.
+- Tests: `tests/pad_press_test.py` (a tap between two polls at 10 and 5 fps, no welded presses, the chord
+  forgetting its latch), `tests/stick_center_test.py` (a lying touch sensor, no rest learned from a push, real
+  drift still fixed - it fails against the old code), `tests/xr_valve_bindings_test.py` (every bound path
+  against the OpenXR 1.1 allowlists per profile, the four face buttons, the Index menu, the two-pass retry,
+  and the Oculus Touch table pinned exactly so the Quest bindings cannot move), plus the updated
+  `tests/mouse_use_test.py` for the new grip rule.
+
